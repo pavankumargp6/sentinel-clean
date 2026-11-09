@@ -1,0 +1,26 @@
+modules:
+  jira:globalPage:
+    - key: sentinel-clean-global-page
+      resource: main
+      resolver:
+        function: resolver
+      render: native
+      title: Sentinel
+      icon: https://developer.atlassian.com/platform/forge/images/icons/issue-panel-icon.svg
+  function:
+    - key: resolver
+      handler: index.handler
+resources:
+  - key: main
+    path: src/frontend/index.jsx
+app:
+  runtime:
+    name: nodejs24.x
+    memoryMB: 256
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/58f3aa11-4304-478a-b553-fd400d59ace0
+permissions:
+  scopes:
+    - read:jira-work
+    - read:graph:issue:jira
+    - storage:app
