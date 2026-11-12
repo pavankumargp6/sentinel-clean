@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import ForgeReconciler, {
+  Badge,
   Button,
   DynamicTable,
   SectionMessage,
@@ -14,6 +15,7 @@ const TABLE_HEAD = {
     { key: 'summary', content: 'Summary', isSortable: true, shouldTruncate: true },
     { key: 'weight', content: 'Weight', isSortable: true },
     { key: 'cluster', content: 'Cluster', isSortable: true },
+    { key: 'environment', content: 'Environment', isSortable: true },
   ],
 };
 
@@ -21,6 +23,7 @@ const HYPOTHESIS_TABLE_HEAD = {
   cells: [
     { key: 'hypothesis', content: 'Hypothesis', isSortable: true },
     { key: 'confidence', content: 'Confidence', isSortable: true },
+    { key: 'corroboration', content: 'Corroboration', isSortable: true },
     { key: 'status', content: 'Status', isSortable: true },
     {
       key: 'evidence',
@@ -39,6 +42,7 @@ function toRows(facts) {
       { key: `${fact.fact_id}:summary`, content: fact.summary },
       { key: `${fact.fact_id}:weight`, content: Number(fact.weight).toFixed(2) },
       { key: `${fact.fact_id}:cluster`, content: fact.cluster },
+      { key: `${fact.fact_id}:environment`, content: fact.environment },
     ],
   }));
 }
@@ -54,49 +58,78 @@ function evidenceFor(hypothesis) {
   const rejectedIds = Array.isArray(hypothesis.rejected_citation_ids)
     ? hypothesis.rejected_citation_ids
     : [];
+  const blockedIds = Array.isArray(hypothesis.blocked_citation_ids)
+    ? hypothesis.blocked_citation_ids
+    : [];
 
   const cited = validIds.length > 0 ? validIds.join(', ') : 'None';
-  const blocked =
+  const hallucinationNote =
     rejectedIds.length > 0
       ? ` (Blocked: ${rejectedIds.length} hallucinated facts)`
       : '';
+  const guardNote =
+    blockedIds.length > 0
+      ? ` (Causal guard: ${blockedIds.length} remediation citations blocked)`
+      : '';
 
-  return `${cited}${blocked}`;
+  return `${cited}${hallucinationNote}${guardNote}`;
 }
 
 function toHypothesisRows(hypotheses) {
-  return hypotheses.map((hypothesis, index) => ({
-    key: `hypothesis:${index}`,
-    cells: [
-      {
-        key: `hypothesis:${index}:summary`,
-        content: hypothesis.summary,
-      },
-      {
-        key: `hypothesis:${index}:confidence`,
-        content: formatConfidence(hypothesis.confidence),
-      },
-      {
-        key: `hypothesis:${index}:status`,
-        content: hypothesis.insufficient_evidence
-          ? 'Insufficient Evidence'
-          : 'Ranked',
-      },
-      {
-        key: `hypothesis:${index}:evidence`,
-        content: evidenceFor(hypothesis),
-      },
-    ],
-  }));
+  return hypotheses.map((hypothesis, index) => {
+    const corroboration = Number.isFinite(hypothesis.corroboration)
+      ? hypothesis.corroboration
+      : 0;
+
+    return {
+      key: `hypothesis:${index}`,
+      cells: [
+        {
+          key: `hypothesis:${index}:summary`,
+          content: hypothesis.summary,
+        },
+        {
+          key: `hypothesis:${index}:confidence`,
+          content: formatConfidence(hypothesis.confidence),
+        },
+        {
+          key: `hypothesis:${index}:corroboration`,
+          content: (
+            <Badge appearance={corroboration > 0 ? 'primary' : 'default'}>
+              {String(corroboration)}
+            </Badge>
+          ),
+        },
+        {
+          key: `hypothesis:${index}:status`,
+          content: hypothesis.insufficient_evidence
+            ? 'Insufficient Evidence'
+            : 'Ranked',
+        },
+        {
+          key: `hypothesis:${index}:evidence`,
+          content: evidenceFor(hypothesis),
+        },
+      ],
+    };
+  });
 }
 
 function messageFor(error) {
   return error && error.message ? error.message : String(error);
 }
 
+function sourceLabel(run) {
+  if (!run) {
+    return null;
+  }
+  return run.fallback_used || run.source === 'mock' ? 'Mock (fallback)' : 'LLM';
+}
+
 const App = () => {
   const [facts, setFacts] = useState([]);
   const [hypotheses, setHypotheses] = useState([]);
+  const [engineRun, setEngineRun] = useState(null);
   const [message, setMessage] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isEngineLoading, setIsEngineLoading] = useState(false);
@@ -173,6 +206,7 @@ const App = () => {
       const nextFacts = await readLedger();
       setFacts(nextFacts);
       setHypotheses([]);
+      setEngineRun(null);
       setMessage({
         appearance: 'success',
         title: 'Demo scenario loaded',
@@ -202,6 +236,7 @@ const App = () => {
       const nextFacts = await readLedger();
       setFacts(nextFacts);
       setHypotheses([]);
+      setEngineRun(null);
       setMessage({
         appearance: 'success',
         title: 'Demo data reset',
@@ -221,19 +256,40 @@ const App = () => {
   const handleRunHypotheses = async () => {
     setIsEngineLoading(true);
     setMessage(null);
+    setEngineRun(null);
     try {
       const result = await invoke('generateHypotheses');
-      if (!Array.isArray(result)) {
+      if (
+        !result ||
+        result.status !== 'SUCCESS' ||
+        !Array.isArray(result.hypotheses)
+      ) {
         throw new Error(
           (result && result.message) ||
             'generateHypotheses did not return scored hypotheses.',
         );
       }
-      setHypotheses(result);
+
+      const run = {
+        source: result.source === 'llm' ? 'llm' : 'mock',
+        model: typeof result.model === 'string' ? result.model : null,
+        fallback_used: Boolean(result.fallback_used),
+        fallback_reason:
+          typeof result.fallback_reason === 'string'
+            ? result.fallback_reason
+            : null,
+      };
+
+      setHypotheses(result.hypotheses);
+      setEngineRun(run);
       setMessage({
-        appearance: 'success',
-        title: 'Hypotheses scored',
-        text: `Scored ${result.length} hypotheses against the ledger.`,
+        appearance: run.fallback_used ? 'warning' : 'success',
+        title: run.fallback_used
+          ? 'Hypotheses scored with fallback'
+          : 'Hypotheses scored',
+        text: `Scored ${result.hypotheses.length} hypotheses with ${sourceLabel(
+          run,
+        )}.`,
       });
     } catch (error) {
       setMessage({
@@ -288,8 +344,10 @@ const App = () => {
 
       <Strong>Hypothesis Engine</Strong>
       <Text>
-        Scores deterministic mock hypotheses against the ledger. Citations to
-        facts that do not exist are rejected as hallucinations.
+        Generates hypotheses with Forge LLM when available, then scores them
+        deterministically against the ledger. If the model is unavailable or
+        returns unusable JSON, this run falls back to the deterministic mock.
+        Citations to facts that do not exist are rejected as hallucinations.
       </Text>
 
       <Button
@@ -299,7 +357,27 @@ const App = () => {
       >
         Run Hypothesis Engine
       </Button>
-      {isEngineLoading && <Text>Scoring hypotheses…</Text>}
+      {isEngineLoading && <Text>Generating and scoring hypotheses…</Text>}
+      {engineRun && (
+        <Text>
+          {`Source: ${sourceLabel(engineRun)}${
+            engineRun.source === 'llm' && engineRun.model
+              ? ` (${engineRun.model})`
+              : ''
+          }`}
+        </Text>
+      )}
+      {engineRun && engineRun.fallback_used && (
+        <SectionMessage appearance="warning" title="LLM fallback used">
+          <Text>
+            {`This run used the deterministic mock instead of Forge LLM.${
+              engineRun.fallback_reason
+                ? ` Reason: ${engineRun.fallback_reason}`
+                : ''
+            }`}
+          </Text>
+        </SectionMessage>
+      )}
 
       <DynamicTable
         caption="Scored hypotheses"

@@ -144,3 +144,160 @@ Notes:
 - `forge login` is interactive; complete it in your terminal.
 - The `storage:app` scope was added in Session 2, so `forge install --upgrade` is still required after deploy.
 - After install, run the UI acceptance checklist above.
+
+## 4. Audit, cluster semantics, and unit tests (Session 3 follow-up)
+- **Date:** Nov 9, 2026
+- **Audit note:** `git log` contains one commit, `7070852 Session 2: ledger, fixtures, KVS storage, DynamicTable UI`. The working tree was clean before this audit, and that commit already contains `src/scoring.js`, `src/mockLLM.js`, and the hypothesis UI. No later commit existed.
+- **Mismatches found and fixed:**
+  - The Fact schema had no required `environment` field. Added it to the typedef, `createFact`, `validateFact`, all six fixtures, and the facts table.
+  - `cluster` was storing environment IDs (`checkout-prod`, `search-prod`) and was documented as an environment. It now stores evidence-signal IDs:
+    - `fact_alert_001`: `symptom-checkout-latency`
+    - `fact_deploy_root_001`: `change-checkout-v2.14.0`
+    - `fact_jira_change_001`: `change-checkout-v2.14.0`
+    - `fact_deploy_decoy_001`: `change-search-v5.2.1`
+    - `fact_runbook_step_001`: `runbook-checkout`
+    - `fact_remediation_001`: `remediation-restart-checkout`
+  - Citation records lacked `hypothesis_id`. Added it to the citation/hypothesis typedefs and every mock citation.
+  - `calculateConfidence` accepted a citation to a `remediation_action` fact. It now blocks those citations through the Causal Inversion Guard and returns them separately in `blocked_citations`; unknown fact IDs remain in `rejected_citations`.
+  - Corroboration was not reported. Added `corroboration` as the count of distinct `source_system` values among valid supporting citations. It is never used as a multiplier.
+  - `generateHypotheses` now returns `hypothesis_id`, `corroboration`, and `blocked_citation_ids` in addition to the existing fields.
+  - The hypothesis table now has a `Corroboration` badge column. The facts table now has an `Environment` column.
+- **Unchanged:** `testTwgRead`, `loadDemoScenario`, `getLedger`, and `resetDemoData` logic. `testTwgRead` was not edited. Load/reset still use deterministic fact IDs and the same KVS keys. No manifest scope changes were made.
+- **Storage note:** because `environment` is now required, facts stored by the previous build must be reloaded (or reset and reloaded) before `getLedger` will validate them. `loadDemoScenario` overwrites the same deterministic keys.
+
+### Unit tests
+- Added `test/scoring.test.js` using `node:test`; added `"test": "node --test"` to `package.json`.
+- `npm test` (Node 22.23.4): **PASS** — 7 tests, 7 passed, 0 failed.
+  - Deploy + Jira in `change-checkout-v2.14.0` count once (confidence `0.88`, not `1`).
+  - `remediation_action` citation is blocked.
+  - Unknown `fact_id` is rejected/ignored.
+  - Zero valid citations score `0` and set `insufficient_evidence: true`.
+  - Contradicting weight above supporting weight clamps confidence to `0`.
+  - Root-cause hypothesis (`0.88`, corroboration `2`) outranks the decoy (`0.28`, corroboration `1`).
+  - Fixtures use the required signal clusters and environments; reloading preserves deterministic IDs; `createFact` rejects a missing environment.
+- Resolver pipeline against the in-memory KVS mock: **PASS** (local only)
+  - `generateHypotheses` returned the same three scores with `hypothesis_id`, `corroboration`, `rejected_citation_ids`, and `blocked_citation_ids`.
+  - `getLedger` returned all 6 facts with environments, including the remediation action.
+- `node --check` for `src/ledger.js`, `src/fixtures.js`, `src/scoring.js`, `src/mockLLM.js`, and `src/index.js`: **PASS**
+- `npx eslint` for the changed JS/JSX files plus the test: **PASS**
+- `npm run lint`: **PASS**
+- Node emitted a benign `MODULE_TYPELESS_PACKAGE_JSON` warning during tests. No `"type": "module"` was added because that could affect Forge packaging; it is unrelated to the test result.
+
+### Forge checks
+- `forge lint`: **UNVERIFIED** — blocked by CLI authentication.
+  - Exact output:
+    ```
+    Error: Not logged in. If a local keychain is available, run forge login, otherwise set environment variables before trying again. See https://go.atlassian.com/dac/platform/forge/getting-started/#log-in-with-an-atlassian-api-token for more.
+
+    Rerunning the command with --verbose may give more details.
+    ```
+- `forge deploy`: **UNVERIFIED** — not run; requires Forge login and was not attempted to avoid an unintended deployment.
+- No manifest scopes changed, so `forge deploy` should not need `--approve`.
+
+### UI acceptance (not yet verified)
+- **UNVERIFIED** — requires deploy + install + browser test:
+  - Facts table shows `Environment` (`checkout-prod` / `search-prod`).
+  - Hypothesis table shows a numeric `Corroboration` badge.
+  - Root hypothesis: confidence `0.88`, corroboration `2`, evidence `fact_deploy_root_001, fact_jira_change_001`.
+  - Decoy: confidence `0.28`, corroboration `1`, evidence `fact_deploy_decoy_001`.
+  - Hallucination: confidence `0.00`, `Insufficient Evidence`, corroboration `0`, evidence `None (Blocked: 1 hallucinated facts)`.
+
+### Commands to finish verification
+```bash
+cd ~/sentinel-clean
+source ~/.nvm/nvm.sh && nvm use 22.23.4
+forge lint
+forge deploy
+```
+Notes:
+- `forge login` must be completed interactively before the Forge commands will work.
+- No scope changed; `--approve` was not used or required.
+
+## 5. Optional Forge LLM hypothesis path (Task B)
+- **Date:** Nov 10, 2026
+- **Scope:** Forge LLM (`claude-sonnet-4-6`) behind `src/llm.js`, with the deterministic mock as fallback. No Rovo agent, MCP server, postmortem, external API, deploy, install, or upgrade was run.
+- **Dependency:** `@forge/llm` `^1.0.10` is installed (resolved `1.0.10`); `package.json` and `package-lock.json` include it. npm reported 19 vulnerabilities in the existing dependency tree; no `npm audit fix` was run. `@forge/llm` requires the Forge runtime, so plain Node imports fail with `Forge runtime not found`; parser tests import only `src/llmParser.js`.
+
+### Changes
+- Added `src/llmParser.js` (pure, no Forge imports):
+  - `contentToText` handles a `string` or `ContentPart[]`.
+  - `stripCodeFences` removes Markdown code fences.
+  - `toPromptFacts` emits only `fact_id`, `fact_type`, `summary`, `observed_at`, and `weight`.
+  - `parseHypotheses` validates JSON/shape, drops malformed hypotheses and citations, filters unknown and explicitly blocked fact IDs, deduplicates citations, caps output, and rebuilds citations with the parent `hypothesis_id`.
+  - Model-provided `confidence`, `notes`, and other extra fields are not carried.
+- Added `src/llm.js` (the only module that imports `@forge/llm`):
+  - `MODEL_ID = 'claude-sonnet-4-6'`, `MAX_COMPLETION_TOKENS = 800`, `TEMPERATURE = 0`.
+  - `LLM_TIMEOUT_MS = 15000`, well under the 25s resolver limit.
+  - The prompt requires JSON only, cites only provided fact IDs, never invents facts, and allows only `supports`/`contradicts`; no confidence is requested.
+  - Any timeout, transport error, missing content, malformed JSON, or empty parse falls back to `generateMockHypotheses` with `fallback_used: true` and a reason.
+- Updated `src/mockLLM.js` to fixture text: `checkout-service v2.14.0` and `search-service v5.2.1`; removed `Deploy #482`, `Deploy #481`, and `cache TTL`.
+- Updated `src/index.js`: `generateHypotheses` now returns `{ status, source, model, fallback_used, fallback_reason, count, hypotheses }`; it passes `remediation_action` IDs from the full ledger as an explicit parser blocklist, and scoring still runs against the full ledger via `calculateConfidence`.
+- Updated `src/frontend/index.jsx`: expects the new result object and shows `Source: LLM (claude-sonnet-4-6)` or `Source: Mock (fallback)`, plus a warning `SectionMessage` when fallback is used.
+- Updated `manifest.yml` with the `llm` module:
+  ```yaml
+  llm:
+    - key: sentinel-llm
+      model:
+        - claude
+  ```
+  No `permissions.scopes` or external egress changed.
+
+### Local checks
+- `npm test` (Node 22.23.4): **PASS** — 16 tests, 16 passed, 0 failed.
+  - New parser tests cover valid JSON, code-fenced JSON, malformed JSON, fake `fact_id`, remediation `fact_id`, content as `ContentPart[]`, malformed-item dropping, and prompt-field allowlisting.
+  - Existing scoring tests still pass; a new assertion checks that mock text matches the fixtures and contains none of the stale strings.
+- `npm run lint`: **PASS** (exit 0).
+- `npx eslint test/llmParser.test.js test/scoring.test.js`: **PASS** (exit 0).
+- Manifest YAML parse and `modules.llm` shape check: **PASS** (key `sentinel-llm`, model `[claude]`, handler still `index.handler`).
+- `src/llm.js` stub checks (no network): **PASS**
+  - Success: `source: "llm"`, model `claude-sonnet-4-6`, request uses `temperature: 0` and `max_completion_tokens: 800`; prompt contains only the five allowed fact fields; unknown and explicitly blocked remediation citations dropped; model `confidence` dropped.
+  - Transport error: falls back to three mock hypotheses with `fallback_used: true`.
+  - Malformed JSON: falls back with a visible reason.
+  - Empty `choices`: falls back with a visible reason.
+  - Timeout: stub hung; fallback returned after **15,016 ms** with `fallback_used: true` and a timeout reason.
+- No test or local check called the real Forge LLM or any network endpoint.
+
+### Forge checks
+- `forge lint`: **UNVERIFIED** — blocked by CLI authentication.
+  - CLI version: `15.0.0` (update `15.1.0` available; not installed).
+  - Exact output:
+    ```
+    Error: Not logged in. If a local keychain is available, run forge login, otherwise set environment variables before trying again. See https://go.atlassian.com/dac/platform/forge/getting-started/#log-in-with-an-atlassian-api-token for more.
+
+    Rerunning the command with --verbose may give more details.
+    ```
+- `forge eligibility --non-interactive -e development`: **UNVERIFIED** — blocked by the same authentication gate.
+  - Exact output:
+    ```
+    Warning: Your version of Forge CLI is out of date. We recommend you update to the latest version to get the latest features and bug fixes.
+    Run npm install -g @forge/cli@latest to update from version 15.0.0 to 15.1.0.
+
+    Error: Not logged in. If a local keychain is available, run forge login, otherwise set environment variables before trying again. See https://go.atlassian.com/dac/platform/forge/getting-started/#log-in-with-an-atlassian-api-token for more.
+
+    Rerunning the command with --verbose may give more details.
+    ```
+- `forge deploy` and `forge install --upgrade`: **UNVERIFIED** — not run, per instruction. No deployment or upgrade was performed.
+- Adding the `llm` module triggers a Forge major-version upgrade even though no scope or external egress changed. No `--approve` rule is expected for this change; `forge install --upgrade` is still required after deploy.
+
+### UI acceptance (not yet verified)
+- **UNVERIFIED** — requires deploy + install + browser test:
+  - Successful model run shows `Source: LLM (claude-sonnet-4-6)` and the scored rows.
+  - Failed model run shows `Source: Mock (fallback)`, the `LLM fallback used` warning, and the scored mock rows.
+  - The existing scoring/guard table behavior is unchanged.
+  - Real model latency, model availability, rate limits, and billing remain **UNVERIFIED**.
+
+### Commands to finish verification (not run)
+```bash
+cd ~/sentinel-clean
+source ~/.nvm/nvm.sh && nvm use 22.23.4
+forge login
+forge lint
+forge eligibility -e development
+forge deploy -e development
+forge install --upgrade -e development
+```
+Notes:
+- `forge login` is interactive; complete it in your terminal.
+- The `llm` module triggers a major version upgrade; the CLI may prompt for major-version confirmation. No scope/egress approval is expected.
+- `forge deploy` and `forge install --upgrade` were deliberately not run.
+- If the CLI update is desired, the exact command reported by the CLI is `npm install -g @forge/cli@latest`; it was not run.

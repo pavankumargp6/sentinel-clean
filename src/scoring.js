@@ -7,23 +7,31 @@
  * @typedef {import('./ledger.js').Fact} Fact
  *
  * @typedef {object} Citation
+ * @property {string} hypothesis_id
  * @property {string} fact_id
  * @property {'supports'|'contradicts'} stance
  *
  * @typedef {object} Hypothesis
+ * @property {string} hypothesis_id
  * @property {string} summary
  * @property {Citation[]} citations
  *
  * @typedef {object} ConfidenceResult
  * @property {number} confidence
  * @property {boolean} insufficient_evidence
+ * @property {number} corroboration
  * @property {Citation[]} valid_citations
  * @property {Citation[]} rejected_citations
+ * @property {Citation[]} blocked_citations
  */
 
 const SUPPORTS = 'supports';
 const CONTRADICTS = 'contradicts';
 const INSUFFICIENT_EVIDENCE_THRESHOLD = 0.2;
+
+function isRemediationAction(fact) {
+  return fact.fact_type === 'remediation_action';
+}
 
 /**
  * Removes facts that must never be presented as a cause.
@@ -62,9 +70,9 @@ function clusterKey(fact) {
 /**
  * Sums only the maximum weight per cluster.
  *
- * Multiple facts from one cluster usually describe the same underlying event
- * (for example, a deploy and its change ticket). Taking the maximum prevents
- * that event from being counted twice.
+ * Multiple facts from one evidence cluster usually describe the same underlying
+ * signal (for example, a deploy and its change ticket). Taking the maximum
+ * prevents that signal from being counted twice.
  */
 function sumClusterMaxima(entries) {
   const maxByCluster = new Map();
@@ -85,12 +93,23 @@ function sumClusterMaxima(entries) {
   return total;
 }
 
+function supportingSourceSystem(fact) {
+  return typeof fact.source_system === 'string' && fact.source_system.trim().length > 0
+    ? fact.source_system.trim()
+    : null;
+}
+
 /**
  * Scores one hypothesis against the full ledger.
  *
- * Citations whose fact_id is absent from allFacts are rejected before scoring,
- * which is the hallucination guard. Valid citations are split by stance and
- * deduplicated per cluster by taking only the maximum weight in each cluster.
+ * Unknown fact IDs are rejected before scoring, which prevents the model from
+ * inventing evidence. Citations to remediation_action facts are blocked by the
+ * Causal Inversion Guard and never count as root-cause support or contradiction.
+ *
+ * Valid citations are split by stance and deduplicated per cluster by taking
+ * only the maximum weight in each cluster. Corroboration is the count of
+ * distinct source_system values among valid supporting citations; it is
+ * reported for display and is never used as a multiplier.
  *
  * A citation with a stance other than "supports" or "contradicts" remains a
  * valid citation but contributes no weight.
@@ -119,8 +138,10 @@ export function calculateConfidence(hypothesis, allFacts) {
     : [];
   const validCitations = [];
   const rejectedCitations = [];
+  const blockedCitations = [];
   const supportEntries = [];
   const contradictEntries = [];
+  const supportingSources = new Set();
 
   for (const citation of citations) {
     if (!citation || typeof citation !== 'object' || Array.isArray(citation)) {
@@ -138,11 +159,20 @@ export function calculateConfidence(hypothesis, allFacts) {
       continue;
     }
 
+    if (isRemediationAction(fact)) {
+      blockedCitations.push(citation);
+      continue;
+    }
+
     validCitations.push(citation);
     const entry = { fact, weight: factWeight(fact) };
 
     if (citation.stance === SUPPORTS) {
       supportEntries.push(entry);
+      const source = supportingSourceSystem(fact);
+      if (source !== null) {
+        supportingSources.add(source);
+      }
     } else if (citation.stance === CONTRADICTS) {
       contradictEntries.push(entry);
     }
@@ -159,7 +189,9 @@ export function calculateConfidence(hypothesis, allFacts) {
     confidence,
     insufficient_evidence:
       totalSupportWeight < INSUFFICIENT_EVIDENCE_THRESHOLD,
+    corroboration: supportingSources.size,
     valid_citations: validCitations,
     rejected_citations: rejectedCitations,
+    blocked_citations: blockedCitations,
   };
 }

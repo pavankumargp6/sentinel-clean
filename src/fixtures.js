@@ -39,7 +39,8 @@ export function buildDemoScenario(now = Date.now()) {
       // Provisional demo prior: a fresh, high-severity alert is strong evidence
       // of impact, but it does not establish the cause by itself.
       weight: 0.93,
-      cluster: 'checkout-prod',
+      cluster: 'symptom-checkout-latency',
+      environment: 'checkout-prod',
     }),
     createFact({
       fact_id: 'fact_deploy_root_001',
@@ -50,10 +51,11 @@ export function buildDemoScenario(now = Date.now()) {
       service_scope: ['checkout-service', 'pricing'],
       summary:
         'checkout-service v2.14.0 deployed; added synchronous tax calculation to the checkout request path.',
-      // Provisional demo prior: a recent deploy in the same cluster is a strong
-      // root-cause candidate, but this is a hand-assigned demo weight.
+      // Provisional demo prior: a recent deploy in the same change cluster is a
+      // strong root-cause candidate, but this is a hand-assigned demo weight.
       weight: 0.88,
-      cluster: 'checkout-prod',
+      cluster: 'change-checkout-v2.14.0',
+      environment: 'checkout-prod',
     }),
     createFact({
       fact_id: 'fact_deploy_decoy_001',
@@ -64,10 +66,11 @@ export function buildDemoScenario(now = Date.now()) {
       service_scope: ['search-service', 'indexing'],
       summary:
         'search-service v5.2.1 deployed to search-prod; it shares no services with checkout.',
-      // Provisional demo prior: recent, but the cluster and service scope do not
-      // match the incident. The low weight is a decoy signal, not a verdict.
+      // Provisional demo prior: recent, but the change cluster and service scope
+      // do not match the incident. The low weight is a decoy signal, not a verdict.
       weight: 0.28,
-      cluster: 'search-prod',
+      cluster: 'change-search-v5.2.1',
+      environment: 'search-prod',
     }),
     createFact({
       fact_id: 'fact_jira_change_001',
@@ -81,7 +84,8 @@ export function buildDemoScenario(now = Date.now()) {
       // Provisional demo prior: an approval record explains intent and timing,
       // but it is not runtime evidence that the deploy caused the alert.
       weight: 0.76,
-      cluster: 'checkout-prod',
+      cluster: 'change-checkout-v2.14.0',
+      environment: 'checkout-prod',
     }),
     createFact({
       fact_id: 'fact_runbook_step_001',
@@ -95,7 +99,8 @@ export function buildDemoScenario(now = Date.now()) {
       // Provisional demo prior: a diagnostic step is useful context, but it is
       // weaker evidence than a live alert or a matching deploy.
       weight: 0.62,
-      cluster: 'checkout-prod',
+      cluster: 'runbook-checkout',
+      environment: 'checkout-prod',
     }),
     createFact({
       fact_id: 'fact_remediation_001',
@@ -109,7 +114,8 @@ export function buildDemoScenario(now = Date.now()) {
       // Provisional demo prior: a recorded mitigation is evidence of what the
       // responder tried, not proof that it worked.
       weight: 0.54,
-      cluster: 'checkout-prod',
+      cluster: 'remediation-restart-checkout',
+      environment: 'checkout-prod',
     }),
   ];
 }

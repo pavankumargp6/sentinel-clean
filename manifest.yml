@@ -10,6 +10,10 @@ modules:
   function:
     - key: resolver
       handler: index.handler
+  llm:
+    - key: sentinel-llm
+      model:
+        - claude
 resources:
   - key: main
     path: src/frontend/index.jsx

@@ -4,7 +4,7 @@ import { kvs, WhereConditions } from '@forge/kvs';
 
 import { buildDemoScenario } from './fixtures.js';
 import { applyCausalInversionGuard, calculateConfidence } from './scoring.js';
-import { generateMockHypotheses } from './mockLLM.js';
+import { generateHypotheses as generateHypothesesWithLLM } from './llm.js';
 import {
   FACT_KEY_PREFIX,
   INDEX_KEY,
@@ -287,7 +287,7 @@ resolver.define('getLedger', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Session 3: deterministic hypothesis engine
+// Session 3: hypothesis engine (Forge LLM with deterministic fallback)
 // ---------------------------------------------------------------------------
 
 resolver.define('generateHypotheses', async () => {
@@ -298,23 +298,41 @@ resolver.define('generateHypotheses', async () => {
     // The generator only sees facts that survive the Causal Inversion Guard, so
     // a recorded remediation action can never be proposed as the cause.
     const filteredFacts = applyCausalInversionGuard(facts);
-    const hypotheses = generateMockHypotheses(filteredFacts);
+    const blockedFactIds = facts
+      .filter((fact) => fact.fact_type === 'remediation_action')
+      .map((fact) => fact.fact_id);
+    const generated = await generateHypothesesWithLLM(
+      filteredFacts,
+      blockedFactIds,
+    );
 
-    // Score against the full ledger. Filtering is a generation boundary, not a
-    // citation-validation loophole: a hypothesis that cites a remediation fact
-    // can still be scored, but a citation to a fact that does not exist is
-    // rejected as a hallucination.
-    return hypotheses.map((hypothesis) => {
+    // Score against the full ledger. Filtering is a generation boundary; the
+    // scorer independently blocks remediation citations and rejects citations
+    // to facts that do not exist.
+    const hypotheses = generated.hypotheses.map((hypothesis) => {
       const scored = calculateConfidence(hypothesis, facts);
 
       return {
+        hypothesis_id: hypothesis.hypothesis_id,
         summary: hypothesis.summary,
         confidence: scored.confidence,
         insufficient_evidence: scored.insufficient_evidence,
+        corroboration: scored.corroboration,
         valid_citation_ids: citationIds(scored.valid_citations),
         rejected_citation_ids: citationIds(scored.rejected_citations),
+        blocked_citation_ids: citationIds(scored.blocked_citations),
       };
     });
+
+    return {
+      status: 'SUCCESS',
+      source: generated.source,
+      model: generated.model,
+      fallback_used: generated.fallback_used,
+      fallback_reason: generated.fallback_reason ?? null,
+      count: hypotheses.length,
+      hypotheses,
+    };
   } catch (error) {
     console.error('generateHypotheses failed:', error);
     throw error;

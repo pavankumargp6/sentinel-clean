@@ -14,7 +14,8 @@
  * @property {string[]} service_scope - Services this fact applies to.
  * @property {string} summary - Human-readable one-line description.
  * @property {number} weight - Hand-assigned demo prior in the range 0-1.
- * @property {string} cluster - Deployment/environment cluster, for example checkout-prod.
+ * @property {string} cluster - Stable ID of the underlying evidence signal, not an environment.
+ * @property {string} environment - Deployment environment, for example checkout-prod.
  */
 
 // Every fact type the ledger currently understands. Keep this list explicit so
@@ -79,9 +80,9 @@ export const WEIGHTS = Object.freeze({
   // This is a prior, not a verdict about any individual fact.
   factTypePrior: 0.15,
 
-  // Cross-cluster penalty: the discount applied when a fact's cluster differs
-  // from the incident cluster. This is a prior for "probably unrelated", not
-  // proof that the fact is irrelevant.
+  // Cross-cluster penalty: the discount applied when a fact belongs to a
+  // different evidence-signal cluster than the hypothesis it supports. This
+  // is a prior for "probably unrelated", not proof that the fact is irrelevant.
   crossClusterPenalty: 0.1,
 });
 
@@ -232,6 +233,7 @@ export function validateFact(fact) {
   readNonEmptyString(fact.summary, 'summary');
   readWeight(fact.weight);
   readNonEmptyString(fact.cluster, 'cluster');
+  readNonEmptyString(fact.environment, 'environment');
   assertFactFitsStorage(fact);
   return fact;
 }
@@ -254,6 +256,7 @@ export function createFact(input) {
     summary: readNonEmptyString(input.summary, 'summary'),
     weight: readWeight(input.weight),
     cluster: readNonEmptyString(input.cluster, 'cluster'),
+    environment: readNonEmptyString(input.environment, 'environment'),
   };
   assertFactFitsStorage(fact);
   return fact;
