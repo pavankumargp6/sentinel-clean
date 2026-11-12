@@ -171,7 +171,8 @@ function normalizeHypothesis(item, allowedFactIds, blockedFactIds) {
     seenCitations.add(citationKey);
 
     // The model does not get to choose a confidence or a citation's parent.
-    // Rebuild the citation with only the fields the scorer understands.
+    // It supplies stance only; the scorer assigns the causal/context role from
+    // the cited fact's type. Rebuild the citation with only known fields.
     citations.push({
       hypothesis_id: hypothesisId,
       fact_id: factId,

@@ -3,7 +3,11 @@ import api from '@forge/api';
 import { kvs, WhereConditions } from '@forge/kvs';
 
 import { buildDemoScenario } from './fixtures.js';
-import { applyCausalInversionGuard, calculateConfidence } from './scoring.js';
+import {
+  applyCausalInversionGuard,
+  calculateConfidence,
+  rankHypotheses,
+} from './scoring.js';
 import { generateHypotheses as generateHypothesesWithLLM } from './llm.js';
 import {
   FACT_KEY_PREFIX,
@@ -307,9 +311,10 @@ resolver.define('generateHypotheses', async () => {
     );
 
     // Score against the full ledger. Filtering is a generation boundary; the
-    // scorer independently blocks remediation citations and rejects citations
-    // to facts that do not exist.
-    const hypotheses = generated.hypotheses.map((hypothesis) => {
+    // scorer independently blocks remediation citations, rejects citations to
+    // facts that do not exist, and treats symptom facts as context rather than
+    // causal support.
+    const scoredHypotheses = generated.hypotheses.map((hypothesis) => {
       const scored = calculateConfidence(hypothesis, facts);
 
       return {
@@ -318,11 +323,20 @@ resolver.define('generateHypotheses', async () => {
         confidence: scored.confidence,
         insufficient_evidence: scored.insufficient_evidence,
         corroboration: scored.corroboration,
+        causal_cluster_count: scored.causal_cluster_count,
+        citations: scored.valid_citations.map((citation) => ({
+          fact_id: citation.fact_id,
+          stance: citation.stance,
+          role: citation.role,
+        })),
         valid_citation_ids: citationIds(scored.valid_citations),
         rejected_citation_ids: citationIds(scored.rejected_citations),
         blocked_citation_ids: citationIds(scored.blocked_citations),
       };
     });
+
+    // Rank in the resolver so every client sees the same order and rank.
+    const hypotheses = rankHypotheses(scoredHypotheses);
 
     return {
       status: 'SUCCESS',

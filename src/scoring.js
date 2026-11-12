@@ -1,6 +1,6 @@
 /**
  * Sentinel scoring: pure, deterministic functions for the Causal Inversion
- * Guard and hypothesis confidence.
+ * Guard, hypothesis confidence, and ranking.
  *
  * This file has no Forge imports so it can be unit-tested with plain Node.
  *
@@ -11,6 +11,12 @@
  * @property {string} fact_id
  * @property {'supports'|'contradicts'} stance
  *
+ * @typedef {object} ScoredCitation
+ * @property {string} hypothesis_id
+ * @property {string} fact_id
+ * @property {'supports'|'contradicts'} stance
+ * @property {'causal'|'context'} role
+ *
  * @typedef {object} Hypothesis
  * @property {string} hypothesis_id
  * @property {string} summary
@@ -20,7 +26,8 @@
  * @property {number} confidence
  * @property {boolean} insufficient_evidence
  * @property {number} corroboration
- * @property {Citation[]} valid_citations
+ * @property {number} causal_cluster_count
+ * @property {ScoredCitation[]} valid_citations
  * @property {Citation[]} rejected_citations
  * @property {Citation[]} blocked_citations
  */
@@ -28,6 +35,20 @@
 const SUPPORTS = 'supports';
 const CONTRADICTS = 'contradicts';
 const INSUFFICIENT_EVIDENCE_THRESHOLD = 0.2;
+
+/**
+ * Fact types that describe the incident symptom or response context.
+ *
+ * They remain valid citations so the UI can show what the hypothesis was
+ * reasoning about, but they contribute no causal support or contradiction.
+ * Keep this list explicit and small; expand it only with a deliberate scoring
+ * change.
+ */
+export const NON_CAUSAL_FACT_TYPES = Object.freeze(['alert']);
+
+function isNonCausal(fact) {
+  return NON_CAUSAL_FACT_TYPES.includes(fact.fact_type);
+}
 
 function isRemediationAction(fact) {
   return fact.fact_type === 'remediation_action';
@@ -52,9 +73,11 @@ export function applyCausalInversionGuard(facts) {
 }
 
 function factWeight(fact) {
-  return typeof fact.weight === 'number' && Number.isFinite(fact.weight)
-    ? fact.weight
-    : 0;
+  if (typeof fact.weight !== 'number' || !Number.isFinite(fact.weight)) {
+    return 0;
+  }
+
+  return Math.min(1, Math.max(0, fact.weight));
 }
 
 function clusterKey(fact) {
@@ -68,13 +91,16 @@ function clusterKey(fact) {
 }
 
 /**
- * Sums only the maximum weight per cluster.
+ * Returns the best weight per evidence cluster.
  *
- * Multiple facts from one evidence cluster usually describe the same underlying
- * signal (for example, a deploy and its change ticket). Taking the maximum
- * prevents that signal from being counted twice.
+ * Multiple facts from one cluster usually describe the same underlying signal
+ * (for example, a deploy and its change ticket). Taking the maximum prevents
+ * that signal from being counted twice.
+ *
+ * @param {{fact: Fact, weight: number}[]} entries
+ * @returns {Map<string, number>}
  */
-function sumClusterMaxima(entries) {
+function bestWeightByCluster(entries) {
   const maxByCluster = new Map();
 
   for (const { fact, weight } of entries) {
@@ -86,11 +112,31 @@ function sumClusterMaxima(entries) {
     }
   }
 
-  let total = 0;
+  return maxByCluster;
+}
+
+/**
+ * Combines independent cluster weights with noisy-OR:
+ * 1 - product(1 - weight).
+ *
+ * This approaches 1 asymptotically but never reaches it from finite,
+ * sub-1.0 weights, so two strong clusters do not automatically saturate.
+ *
+ * @param {Map<string, number>} maxByCluster
+ * @returns {number}
+ */
+function noisyOr(maxByCluster) {
+  let product = 1;
+
   for (const weight of maxByCluster.values()) {
-    total += weight;
+    product *= 1 - weight;
   }
-  return total;
+
+  return 1 - product;
+}
+
+function clamp01(value) {
+  return Math.min(1, Math.max(0, value));
 }
 
 function supportingSourceSystem(fact) {
@@ -106,10 +152,19 @@ function supportingSourceSystem(fact) {
  * inventing evidence. Citations to remediation_action facts are blocked by the
  * Causal Inversion Guard and never count as root-cause support or contradiction.
  *
- * Valid citations are split by stance and deduplicated per cluster by taking
- * only the maximum weight in each cluster. Corroboration is the count of
- * distinct source_system values among valid supporting citations; it is
- * reported for display and is never used as a multiplier.
+ * Non-causal facts (currently alerts) remain valid citations with role
+ * "context", but contribute no support/contradiction weight and do not count
+ * toward corroboration.
+ *
+ * Valid causal citations are split by stance and deduplicated per cluster by
+ * taking only the maximum weight in each cluster. Support and contradiction are
+ * each combined with noisy-OR across clusters, then confidence is
+ * support * (1 - contradiction), clamped to [0, 1].
+ *
+ * Corroboration is the count of distinct source_system values among valid
+ * causal supporting citations; it is reported for display and is never used as
+ * a multiplier. causal_cluster_count is the number of distinct clusters among
+ * those supporting causal citations.
  *
  * A citation with a stance other than "supports" or "contradicts" remains a
  * valid citation but contributes no weight.
@@ -133,6 +188,10 @@ export function calculateConfidence(hypothesis, allFacts) {
     }
   }
 
+  const hypothesisId =
+    typeof hypothesis.hypothesis_id === 'string'
+      ? hypothesis.hypothesis_id
+      : '';
   const citations = Array.isArray(hypothesis.citations)
     ? hypothesis.citations
     : [];
@@ -164,7 +223,18 @@ export function calculateConfidence(hypothesis, allFacts) {
       continue;
     }
 
-    validCitations.push(citation);
+    const role = isNonCausal(fact) ? 'context' : 'causal';
+    validCitations.push({
+      hypothesis_id: hypothesisId,
+      fact_id: citation.fact_id,
+      stance: citation.stance,
+      role,
+    });
+
+    if (role === 'context') {
+      continue;
+    }
+
     const entry = { fact, weight: factWeight(fact) };
 
     if (citation.stance === SUPPORTS) {
@@ -178,20 +248,57 @@ export function calculateConfidence(hypothesis, allFacts) {
     }
   }
 
-  const totalSupportWeight = sumClusterMaxima(supportEntries);
-  const totalContradictWeight = sumClusterMaxima(contradictEntries);
-  const confidence = Math.min(
-    1,
-    Math.max(0, totalSupportWeight - totalContradictWeight),
-  );
+  const supportByCluster = bestWeightByCluster(supportEntries);
+  const contradictByCluster = bestWeightByCluster(contradictEntries);
+  const support = noisyOr(supportByCluster);
+  const contradiction = noisyOr(contradictByCluster);
+  const confidence =
+    validCitations.length === 0
+      ? 0
+      : clamp01(support * (1 - contradiction));
 
   return {
     confidence,
-    insufficient_evidence:
-      totalSupportWeight < INSUFFICIENT_EVIDENCE_THRESHOLD,
+    insufficient_evidence: support < INSUFFICIENT_EVIDENCE_THRESHOLD,
     corroboration: supportingSources.size,
+    causal_cluster_count: supportByCluster.size,
     valid_citations: validCitations,
     rejected_citations: rejectedCitations,
     blocked_citations: blockedCitations,
   };
+}
+
+function numberOrZero(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * Ranks scored hypotheses deterministically.
+ *
+ * Order: confidence descending, then corroboration descending, then number of
+ * supporting causal clusters descending. Ties beyond that keep the input order
+ * (Array.prototype.sort is stable in supported Node versions).
+ *
+ * @param {object[]} hypotheses - Scored hypotheses with confidence,
+ *   corroboration, and causal_cluster_count fields.
+ * @returns {object[]} New objects sorted and annotated with a 1-based rank.
+ */
+export function rankHypotheses(hypotheses) {
+  if (!Array.isArray(hypotheses)) {
+    throw new TypeError('rankHypotheses expects an array of hypotheses.');
+  }
+
+  return hypotheses
+    .map((hypothesis) => ({ ...hypothesis }))
+    .sort(
+      (left, right) =>
+        numberOrZero(right.confidence) - numberOrZero(left.confidence) ||
+        numberOrZero(right.corroboration) - numberOrZero(left.corroboration) ||
+        numberOrZero(right.causal_cluster_count) -
+          numberOrZero(left.causal_cluster_count),
+    )
+    .map((hypothesis, index) => ({
+      ...hypothesis,
+      rank: index + 1,
+    }));
 }

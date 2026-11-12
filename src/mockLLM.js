@@ -5,6 +5,10 @@
  * pipeline and the hallucination guard can be tested repeatably, and so the UI
  * still has useful output when the model is unavailable.
  *
+ * The citations deliberately use the same conventions as the prompt: the alert
+ * is context, a decoy deploy is cited as a contradiction where it weakens a
+ * hypothesis, and irrelevant facts are omitted.
+ *
  * @typedef {import('./ledger.js').Fact} Fact
  *
  * @param {Fact[]} filteredFacts - Facts that survived the Causal Inversion
@@ -43,6 +47,16 @@ export function generateMockHypotheses(filteredFacts) {
           fact_id: 'fact_jira_change_001',
           stance: 'supports',
         },
+        {
+          hypothesis_id: 'hypothesis_checkout_v2140',
+          fact_id: 'fact_deploy_decoy_001',
+          stance: 'contradicts',
+        },
+        {
+          hypothesis_id: 'hypothesis_checkout_v2140',
+          fact_id: 'fact_alert_001',
+          stance: 'supports',
+        },
       ],
     },
     {
@@ -55,6 +69,16 @@ export function generateMockHypotheses(filteredFacts) {
           fact_id: 'fact_deploy_decoy_001',
           stance: 'supports',
         },
+        {
+          hypothesis_id: 'hypothesis_search_v521',
+          fact_id: 'fact_deploy_root_001',
+          stance: 'contradicts',
+        },
+        {
+          hypothesis_id: 'hypothesis_search_v521',
+          fact_id: 'fact_alert_001',
+          stance: 'supports',
+        },
       ],
     },
     {
@@ -65,6 +89,11 @@ export function generateMockHypotheses(filteredFacts) {
         {
           hypothesis_id: 'hypothesis_unrecorded_migration',
           fact_id: 'fact_does_not_exist_999',
+          stance: 'supports',
+        },
+        {
+          hypothesis_id: 'hypothesis_unrecorded_migration',
+          fact_id: 'fact_alert_001',
           stance: 'supports',
         },
       ],

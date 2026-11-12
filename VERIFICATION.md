@@ -301,3 +301,84 @@ Notes:
 - The `llm` module triggers a major version upgrade; the CLI may prompt for major-version confirmation. No scope/egress approval is expected.
 - `forge deploy` and `forge install --upgrade` were deliberately not run.
 - If the CLI update is desired, the exact command reported by the CLI is `npm install -g @forge/cli@latest`; it was not run.
+
+## 6. Score saturation fix: context facts, noisy-OR, and ranking (Session 5)
+- **Date:** Nov 12, 2026
+- **Scope:** Scoring, mock/LLM citation conventions, resolver output, and hypothesis UI only. No MCP server, Rovo agent, postmortem, approval card, manifest scope, or external egress was added. No deploy, install, or upgrade was run.
+
+### Audit: why every live score was 1.00
+- `calculateConfidence` kept the maximum weight per cluster and then **summed** those maxima (`sumClusterMaxima`), finally applying `Math.min(1, ...)`.
+- The live model cited `fact_alert_001` (weight `0.93`) as `supports` on every hypothesis.
+- Each hypothesis also had at least one causal cluster: checkout `0.88`, search `0.28`, so totals reached `0.93 + 0.88 = 1.81` and `0.93 + 0.28 = 1.21`.
+- The `1.0` cap then flattened the real checkout hypothesis, the search decoy, and any other hypothesis into the same `1.00` score.
+- The root cause was symptom evidence counting as causal support plus an additive formula that saturates; the fix is an explicit context role and noisy-OR combination.
+
+### Changes
+- `src/scoring.js`
+  - Added `NON_CAUSAL_FACT_TYPES = ['alert']`; matching facts are valid citations with role `context`, contribute zero support/contradiction weight, and are excluded from corroboration and `causal_cluster_count`.
+  - Replaced summed cluster maxima with noisy-OR: `support = 1 - product(1 - best_support_weight_per_cluster)` and `contradiction = 1 - product(1 - best_contradict_weight_per_cluster)`.
+  - Confidence is `clamp(0, 1, support * (1 - contradiction))`; zero valid citations still returns `0`, and `support < 0.2` still sets `insufficient_evidence`.
+  - Kept best weight per cluster, unknown fact ID rejection, remediation blocking, and corroboration as a display-only badge.
+  - Added `causal_cluster_count` and `rankHypotheses`: confidence desc, corroboration desc, then supporting causal cluster count desc; assigns 1-based `rank`.
+- `src/mockLLM.js`
+  - Alert citations are now context; the checkout hypothesis cites the search decoy as `contradicts`, and the search hypothesis cites the checkout deploy as `contradicts`. Irrelevant facts are omitted.
+- `src/index.js`
+  - Returns structured `citations: [{ fact_id, stance, role }]`, `causal_cluster_count`, and ranked hypotheses with `rank`. Scoring still uses the full ledger so remediation citations are blocked and unknown IDs rejected independently of generation.
+- `src/frontend/index.jsx`
+  - Added a `Rank` column and per-citation labels: `fact_deploy_root_001 (supports)`, `fact_deploy_decoy_001 (contradicts)`, `fact_alert_001 (context)`.
+- `src/llm.js`
+  - Prompt now states an alert is the symptom to explain, not causal evidence; alert citations are context with no causal weight; `contradicts` is for weakening facts such as an unrelated deploy; irrelevant facts must be omitted; every hypothesis must cite at least one non-alert fact.
+- `src/llmParser.js`
+  - Comment clarified that the model supplies stance only and the scorer assigns the causal/context role from `fact_type`. No parser behavior changed.
+
+### Tests
+- `test/scoring.test.js` rewritten for the new formula and ranking: **16 tests**.
+  - New coverage: alert-only is context with zero support; alert + deploy does not exceed deploy alone; two causal clusters (`0.88` + `0.62`) score `0.9544`, not `1.0`; decoy-only support scores `0.28`; decoy as contradiction lowers `0.88` to `0.6336`; proportional contradiction (`0.4` vs `0.9` gives `0.04`); ranking by confidence, corroboration, then causal clusters; mock citation conventions.
+  - Existing tests updated because they assumed the old formula:
+    - Contradiction above support previously clamped to `0`; now it is proportional (`0.4 * (1 - 0.9) = 0.04`).
+    - Demo root/decoy expectations changed from `0.88`/`0.28` to `0.6336`/`0.0336` because the mock now cites mutual contradictions.
+    - Same-cluster test now also asserts `causal_cluster_count` and citation roles.
+    - Mock citation test now expects alert context and decoy contradictions.
+- `test/llmParser.test.js` unchanged: **8 tests**, all still pass (fake and remediation fact IDs are still dropped).
+- `npm test` (Node `22.23.4`): **PASS** — 24 tests, 24 passed, 0 failed.
+- `npm run lint`: **PASS** (exit 0).
+- `npx eslint test/scoring.test.js test/llmParser.test.js`: **PASS** (exit 0).
+- Node emitted the existing benign `MODULE_TYPELESS_PACKAGE_JSON` warning; `"type": "module"` was not added because it could affect Forge packaging.
+
+### Expected scores on the demo fixtures
+- Mock checkout hypothesis: confidence `0.6336`, corroboration `2`, causal clusters `1`, rank `1`.
+- Mock search hypothesis: confidence `0.0336`, corroboration `1`, causal clusters `1`, rank `2`.
+- Mock hallucination: confidence `0` (unknown fact ID rejected, alert is context), `insufficient_evidence: true`, rank `3`.
+
+### Forge checks
+- `forge lint`: **UNVERIFIED** — blocked by CLI authentication. CLI version `15.0.0`; update `15.1.0` available but not installed.
+  - Exact output:
+    ```
+    Warning: Your version of Forge CLI is out of date. We recommend you update to the latest version to get the latest features and bug fixes.
+    Run npm install -g @forge/cli@latest to update from version 15.0.0 to 15.1.0.
+
+    Error: Not logged in. If a local keychain is available, run forge login, otherwise set environment variables before trying again. See https://go.atlassian.com/dac/platform/forge/getting-started/#log-in-with-an-atlassian-api-token for more.
+
+    Rerunning the command with --verbose may give more details.
+    ```
+- `forge deploy -e development`: **UNVERIFIED** — not run; requires Forge login. No manifest or scope change, so no `--approve` is expected.
+- No scope or egress change was needed.
+
+### UI and live-model acceptance (not yet verified)
+- **UNVERIFIED** — requires deploy + install + browser test:
+  - Hypothesis table shows the `Rank` column in resolver order (`1`, `2`, `3`).
+  - Evidence shows `fact_deploy_root_001 (supports), fact_jira_change_001 (supports), fact_deploy_decoy_001 (contradicts), fact_alert_001 (context)` for the checkout hypothesis.
+  - The live model's new prompt behavior, real scores, latency, availability, rate limits, and billing are **UNVERIFIED** until a deployed run is observed.
+
+### Exact commands to finish verification (not run)
+```bash
+cd ~/sentinel-clean
+source ~/.nvm/nvm.sh && nvm use 22.23.4
+forge login
+forge lint
+forge deploy -e development
+```
+Notes:
+- `forge login` is interactive; complete it in your terminal.
+- `forge install --upgrade` is not required for this change because the manifest and scopes did not change; the Session 4 install already includes the `llm` module.
+- `forge lint` and `forge deploy -e development` were deliberately not run because the CLI is not authenticated on this machine.

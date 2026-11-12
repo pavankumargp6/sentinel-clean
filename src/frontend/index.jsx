@@ -21,6 +21,7 @@ const TABLE_HEAD = {
 
 const HYPOTHESIS_TABLE_HEAD = {
   cells: [
+    { key: 'rank', content: 'Rank', isSortable: true },
     { key: 'hypothesis', content: 'Hypothesis', isSortable: true },
     { key: 'confidence', content: 'Confidence', isSortable: true },
     { key: 'corroboration', content: 'Corroboration', isSortable: true },
@@ -51,7 +52,25 @@ function formatConfidence(value) {
   return Number.isFinite(value) ? value.toFixed(2) : '0.00';
 }
 
+function citationLabel(citation) {
+  if (!citation || typeof citation.fact_id !== 'string') {
+    return null;
+  }
+  if (citation.role === 'context') {
+    return `${citation.fact_id} (context)`;
+  }
+  if (citation.stance === 'supports' || citation.stance === 'contradicts') {
+    return `${citation.fact_id} (${citation.stance})`;
+  }
+  return citation.fact_id;
+}
+
 function evidenceFor(hypothesis) {
+  const citations = Array.isArray(hypothesis.citations)
+    ? hypothesis.citations
+        .map((citation) => citationLabel(citation))
+        .filter((label) => label !== null)
+    : [];
   const validIds = Array.isArray(hypothesis.valid_citation_ids)
     ? hypothesis.valid_citation_ids
     : [];
@@ -62,7 +81,12 @@ function evidenceFor(hypothesis) {
     ? hypothesis.blocked_citation_ids
     : [];
 
-  const cited = validIds.length > 0 ? validIds.join(', ') : 'None';
+  const cited =
+    citations.length > 0
+      ? citations.join(', ')
+      : validIds.length > 0
+        ? validIds.join(', ')
+        : 'None';
   const hallucinationNote =
     rejectedIds.length > 0
       ? ` (Blocked: ${rejectedIds.length} hallucinated facts)`
@@ -80,10 +104,15 @@ function toHypothesisRows(hypotheses) {
     const corroboration = Number.isFinite(hypothesis.corroboration)
       ? hypothesis.corroboration
       : 0;
+    const rank = Number.isFinite(hypothesis.rank) ? hypothesis.rank : index + 1;
 
     return {
       key: `hypothesis:${index}`,
       cells: [
+        {
+          key: `hypothesis:${index}:rank`,
+          content: String(rank),
+        },
         {
           key: `hypothesis:${index}:summary`,
           content: hypothesis.summary,

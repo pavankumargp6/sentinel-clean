@@ -41,8 +41,12 @@ Rules:
 - Each citation must have "hypothesis_id", "fact_id", and "stance".
 - Cite only fact_id values present in the provided facts. Never invent facts or fact IDs.
 - "stance" must be exactly "supports" or "contradicts".
+- An alert fact (fact_type "alert") describes the symptom to be explained. It is context, not causal evidence; never treat an alert as support for a root cause.
+- Alert citations may be included for context, but they contribute no causal weight.
+- Use "contradicts" for facts that weaken a hypothesis, for example a deploy to an unrelated service.
+- Omit facts that are irrelevant to a hypothesis instead of citing them.
 - Do not include a confidence, probability, or score. The application calculates confidence deterministically.
-- Every hypothesis must cite at least one provided fact.`;
+- Every hypothesis must cite at least one non-alert provided fact.`;
 
 function errorMessage(error) {
   const message = error instanceof Error ? error.message : String(error);
