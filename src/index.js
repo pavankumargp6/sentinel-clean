@@ -9,6 +9,13 @@ import {
   rankHypotheses,
 } from './scoring.js';
 import { generateHypotheses as generateHypothesesWithLLM } from './llm.js';
+import { buildTopProposal, proposalKey } from './remediation.js';
+import {
+  AUDIT_INDEX_KEY,
+  AUDIT_INDEX_VERSION,
+  auditKey,
+  createAuditRecord,
+} from './auditLog.js';
 import {
   FACT_KEY_PREFIX,
   INDEX_KEY,
@@ -185,6 +192,37 @@ function citationIds(citations) {
   return Array.from(new Set(ids));
 }
 
+/**
+ * Scores generated hypotheses against the full ledger and ranks them.
+ *
+ * getProposal uses this path so the approval card and the hypothesis table share
+ * the same scoring logic. generateHypotheses keeps its existing inline path.
+ */
+function scoreAndRankHypotheses(generated, facts) {
+  const scoredHypotheses = generated.hypotheses.map((hypothesis) => {
+    const scored = calculateConfidence(hypothesis, facts);
+
+    return {
+      hypothesis_id: hypothesis.hypothesis_id,
+      summary: hypothesis.summary,
+      confidence: scored.confidence,
+      insufficient_evidence: scored.insufficient_evidence,
+      corroboration: scored.corroboration,
+      causal_cluster_count: scored.causal_cluster_count,
+      citations: scored.valid_citations.map((citation) => ({
+        fact_id: citation.fact_id,
+        stance: citation.stance,
+        role: citation.role,
+      })),
+      valid_citation_ids: citationIds(scored.valid_citations),
+      rejected_citation_ids: citationIds(scored.rejected_citations),
+      blocked_citation_ids: citationIds(scored.blocked_citations),
+    };
+  });
+
+  return rankHypotheses(scoredHypotheses);
+}
+
 // ---------------------------------------------------------------------------
 // Existing verified handler: do not change its behavior.
 // ---------------------------------------------------------------------------
@@ -350,6 +388,173 @@ resolver.define('generateHypotheses', async () => {
   } catch (error) {
     console.error('generateHypotheses failed:', error);
     throw error;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Session 6: remediation proposal and audit log
+// ---------------------------------------------------------------------------
+
+resolver.define('getProposal', async () => {
+  try {
+    const { facts, missing } = await readLedgerFacts();
+    warnAboutMissing('getProposal', missing);
+
+    const filteredFacts = applyCausalInversionGuard(facts);
+    const blockedFactIds = facts
+      .filter((fact) => fact.fact_type === 'remediation_action')
+      .map((fact) => fact.fact_id);
+    const generated = await generateHypothesesWithLLM(
+      filteredFacts,
+      blockedFactIds,
+    );
+    const hypotheses = scoreAndRankHypotheses(generated, facts);
+    const topHypothesis =
+      hypotheses.find((hypothesis) => hypothesis.rank === 1) ||
+      hypotheses[0] ||
+      null;
+
+    const now = Date.now();
+    const { proposal, reason } = buildTopProposal(hypotheses, {
+      facts,
+      now,
+    });
+
+    // Store the proposal so recordDecision can audit it without requiring the
+    // client to echo the full proposal back. The proposal is not an audit
+    // record; it may be overwritten by the next getProposal call.
+    if (proposal) {
+      await kvs.set(
+        proposalKey(proposal.proposal_id),
+        {
+          proposal,
+          top_hypothesis: topHypothesis,
+          created_at: new Date(now).toISOString(),
+        },
+        { keyPolicy: 'OVERRIDE' },
+      );
+    }
+
+    return {
+      status: 'SUCCESS',
+      proposal,
+      reason: reason ?? null,
+      source: generated.source,
+      model: generated.model,
+      fallback_used: generated.fallback_used,
+      fallback_reason: generated.fallback_reason ?? null,
+      top_hypothesis: topHypothesis,
+    };
+  } catch (error) {
+    console.error('getProposal failed:', error);
+    return { status: 'ERROR', message: errorMessage(error) };
+  }
+});
+
+resolver.define('recordDecision', async ({ payload, context } = {}) => {
+  try {
+    const body = payload && typeof payload === 'object' ? payload : {};
+    const proposalId =
+      typeof body.proposal_id === 'string' ? body.proposal_id.trim() : '';
+    const decision =
+      body.decision === 'approve' || body.decision === 'reject'
+        ? body.decision
+        : null;
+    const note = typeof body.note === 'string' ? body.note.trim() : '';
+
+    if (proposalId.length === 0) {
+      return { status: 'ERROR', message: 'proposal_id is required.' };
+    }
+    if (decision === null) {
+      return { status: 'ERROR', message: 'decision must be "approve" or "reject".' };
+    }
+
+    const stored = await kvs.get(proposalKey(proposalId));
+    if (!stored || typeof stored !== 'object' || !stored.proposal) {
+      return {
+        status: 'ERROR',
+        message: 'Proposal not found. Run getProposal first.',
+      };
+    }
+
+    const decidedBy =
+      context &&
+      typeof context.accountId === 'string' &&
+      context.accountId.trim().length > 0
+        ? context.accountId.trim()
+        : 'unknown';
+    const now = Date.now();
+    let auditRecord = null;
+
+    // Append-only: FAIL_IF_EXISTS guarantees a key is never overwritten. If a
+    // collision occurs, retry with a fresh suffix.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const suffix = `${now.toString(36)}_${Math.random()
+        .toString(36)
+        .slice(2, 8)}_${attempt}`;
+      auditRecord = createAuditRecord({
+        proposal: stored.proposal,
+        topHypothesis: stored.top_hypothesis,
+        decision,
+        note,
+        decidedBy,
+        now,
+        suffix,
+      });
+
+      try {
+        await kvs.set(auditKey(auditRecord.audit_id), auditRecord, {
+          keyPolicy: 'FAIL_IF_EXISTS',
+        });
+        break;
+      } catch (error) {
+        if (attempt === 4) {
+          throw error;
+        }
+      }
+    }
+
+    const indexRaw = await kvs.get(AUDIT_INDEX_KEY);
+    const index =
+      indexRaw && typeof indexRaw === 'object' && Array.isArray(indexRaw.audit_ids)
+        ? { version: AUDIT_INDEX_VERSION, audit_ids: indexRaw.audit_ids }
+        : { version: AUDIT_INDEX_VERSION, audit_ids: [] };
+
+    if (!index.audit_ids.includes(auditRecord.audit_id)) {
+      index.audit_ids.push(auditRecord.audit_id);
+    }
+    await kvs.set(AUDIT_INDEX_KEY, index, { keyPolicy: 'OVERRIDE' });
+
+    return { status: 'SUCCESS', audit: auditRecord };
+  } catch (error) {
+    console.error('recordDecision failed:', error);
+    return { status: 'ERROR', message: errorMessage(error) };
+  }
+});
+
+resolver.define('getAuditLog', async () => {
+  try {
+    const indexRaw = await kvs.get(AUDIT_INDEX_KEY);
+    if (
+      !indexRaw ||
+      typeof indexRaw !== 'object' ||
+      !Array.isArray(indexRaw.audit_ids)
+    ) {
+      return { status: 'SUCCESS', audits: [], count: 0 };
+    }
+
+    const ids = indexRaw.audit_ids.filter((id) => typeof id === 'string');
+    const stored = await Promise.all(
+      ids.map(async (id) => ({ id, record: await kvs.get(auditKey(id)) })),
+    );
+    const audits = stored
+      .filter((entry) => entry.record && typeof entry.record === 'object')
+      .map((entry) => entry.record);
+
+    return { status: 'SUCCESS', audits, count: audits.length };
+  } catch (error) {
+    console.error('getAuditLog failed:', error);
+    return { status: 'ERROR', message: errorMessage(error) };
   }
 });
 

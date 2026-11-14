@@ -382,3 +382,93 @@ Notes:
 - `forge login` is interactive; complete it in your terminal.
 - `forge install --upgrade` is not required for this change because the manifest and scopes did not change; the Session 4 install already includes the `llm` module.
 - `forge lint` and `forge deploy -e development` were deliberately not run because the CLI is not authenticated on this machine.
+
+## 7. Remediation proposal and audit log (Session 6)
+- **Date:** Nov 13, 2026
+- **Scope:** Pure remediation proposal builder, append-only KVS audit records, approval-card UI, and audit-log table. No postmortem, MCP server, Rovo agent, external write, deploy, install, or upgrade was run.
+- **Storage:** Proposals and audit records use the existing `storage:app` scope. No manifest scope or egress change was needed.
+
+### Changes
+- Added `src/remediation.js` (pure, no Forge imports):
+  - `MIN_CONFIDENCE = 0.5`; a hypothesis below that returns `{ proposal: null, reason: "insufficient evidence" }`.
+  - `buildProposal(hypothesis, { facts, blastRadius, now })` builds `{ proposal_id, hypothesis_id, action, target, rationale, evidence_fact_ids, blast_radius, instructions, diff, confidence, created_at }`.
+  - Action is `rollback` when a supporting causal citation points at a `deploy` fact, otherwise `restart`. Target comes from the deploy fact's `service_scope`.
+  - Rollback/restart is explicitly human-executed: `instructions` and a text `diff` are included, and the function performs no external write.
+  - `buildTopProposal(hypotheses, options)` picks the rank-1 hypothesis.
+  - `proposalKey` / `proposalIdFromKey` provide storage-key helpers.
+- Added `src/auditLog.js` (pure, no Forge imports):
+  - `AUDIT_KEY_PREFIX = 'sentinel:audit:'`, `AUDIT_INDEX_KEY = 'sentinel:audit:index'`.
+  - `buildAuditId(now, suffix)` produces a deterministic ID with a timestamp suffix.
+  - `createAuditRecord({ proposal, topHypothesis, decision, note, decidedBy, now, suffix })` builds `{ audit_id, proposal_id, hypothesis_id, decision, decided_at, decided_by, evidence_fact_ids, confidence_at_decision, note }`.
+  - `validateAuditRecord` checks the record shape.
+  - `auditKey` / `auditIdFromKey` provide storage-key helpers.
+- Updated `src/fixtures.js`:
+  - Added `BLAST_RADIUS`, a small seeded demo table clearly labelled as seeded demo data, not a live or simulated service graph.
+- Updated `src/index.js`:
+  - Added `scoreAndRankHypotheses` so `getProposal` and the approval card share the existing scoring path; `generateHypotheses` itself was not changed.
+  - Added `getProposal`: reads the ledger, generates and ranks hypotheses, builds the top proposal, and stores `{ proposal, top_hypothesis, created_at }` in KVS so `recordDecision` can audit it without echoing the full proposal from the client.
+  - Added `recordDecision({ proposal_id, decision, note })`: reads the stored proposal, writes an append-only audit record with `keyPolicy: 'FAIL_IF_EXISTS'`, and appends the audit ID to the index key. `decided_by` uses `context.accountId` when available, otherwise `"unknown"`.
+  - Added `getAuditLog`: reads the audit index and returns the audit records.
+- Updated `src/frontend/index.jsx`:
+  - Added a "Get Remediation Proposal" button and an approval card showing the top hypothesis, confidence, evidence with stance/role, blast-radius table, human-executed instructions, text diff, optional note, and Approve/Reject buttons.
+  - After a decision, the card shows the decision and disables both buttons.
+  - Added an Audit Log table, loaded on mount and refreshed after a decision.
+  - Loading/resetting the demo or running the hypothesis engine clears any prior proposal and decision.
+
+### Tests
+- `test/remediation.test.js`: **6 tests**, all pass.
+  - Proposal built for the qualifying top hypothesis (`rollback`, target `checkout-service`, evidence IDs, seeded blast radius, human-executed instructions/diff).
+  - Low-confidence and malformed hypotheses return `{ proposal: null, reason: "insufficient evidence" }`.
+  - `buildTopProposal` picks rank 1; empty input returns null.
+  - Proposal storage key round-trips.
+- `test/auditLog.test.js`: **5 tests**, all pass.
+  - Audit ID is deterministic with a timestamp suffix.
+  - Audit storage key round-trips; index key is correct.
+  - Audit record has the required shape and defaults `decided_by` to `"unknown"` and `note` to `null`.
+  - Invalid decisions/proposals throw.
+- `npm test` (Node `22.23.4`): **PASS** — 35 tests, 35 passed, 0 failed.
+- `npm run lint`: **PASS** (exit 0).
+- `npx eslint test/remediation.test.js test/auditLog.test.js`: **PASS** (exit 0).
+- `node --check src/remediation.js src/auditLog.js src/index.js src/fixtures.js`: **PASS**.
+
+### Expected proposal on the demo fixtures
+- Top hypothesis `hypothesis_checkout_v2140` has confidence `0.6336`, so it qualifies.
+- Proposal action is `rollback`, target `checkout-service`.
+- Blast radius is seeded from `BLAST_RADIUS` and includes `checkout-service` plus its seeded dependents `payments`, `tax-service`, and `frontend`.
+- A low-confidence hypothesis (for example the `0.0336` search decoy or the `0` hallucination) returns `{ proposal: null, reason: "insufficient evidence" }`.
+
+### Forge checks
+- `forge lint`: **UNVERIFIED** — blocked by CLI authentication. CLI version `15.0.0`; update `15.1.0` available but not installed.
+  - Exact output:
+    ```
+    Warning: Your version of Forge CLI is out of date. We recommend you update to the latest version to get the latest features and bug fixes.
+    Run npm install -g @forge/cli@latest to update from version 15.0.0 to 15.1.0.
+
+    Error: Not logged in. If a local keychain is available, run forge login, otherwise set environment variables before trying again. See https://go.atlassian.com/dac/platform/forge/getting-started/#log-in-with-an-atlassian-api-token for more.
+
+    Rerunning the command with --verbose may give more details.
+    ```
+- `forge deploy -e development`: **UNVERIFIED** — not run; requires Forge login. No manifest or scope change, so no `--approve` is expected.
+- No scope or egress change was needed.
+
+### UI and live-model acceptance (not yet verified)
+- **UNVERIFIED** — requires deploy + install + browser test:
+  - `Get Remediation Proposal` shows the checkout rollback proposal with confidence `0.63`.
+  - Evidence shows `fact_deploy_root_001 (supports)`, `fact_jira_change_001 (supports)`, `fact_deploy_decoy_001 (contradicts)`, `fact_alert_001 (context)`.
+  - Blast radius shows the seeded checkout service and dependent rows.
+  - Approve/Reject writes an audit record, disables both buttons, and refreshes the Audit Log table.
+  - A low-confidence run shows `No proposal` / `insufficient evidence`.
+  - Real model output, KVS persistence, and the resolver account ID in `decided_by` remain **UNVERIFIED** until a deployed run is observed.
+
+### Exact commands to finish verification (not run)
+```bash
+cd ~/sentinel-clean
+source ~/.nvm/nvm.sh && nvm use 22.23.4
+forge login
+forge lint
+forge deploy -e development
+```
+Notes:
+- `forge login` is interactive; complete it in your terminal.
+- No scope changed, so `--approve` is not expected and `forge install --upgrade` is not required.
+- `forge lint` and `forge deploy -e development` were deliberately not run because the CLI is not authenticated on this machine.

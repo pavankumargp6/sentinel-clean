@@ -119,3 +119,43 @@ export function buildDemoScenario(now = Date.now()) {
     }),
   ];
 }
+
+/**
+ * Seeded demo blast-radius table.
+ *
+ * This is intentionally small, hand-entered demo data for the checkout
+ * incident. It is NOT a live service graph, discovery result, or simulated
+ * dependency model. Do not treat it as real ownership or topology data.
+ */
+export const BLAST_RADIUS = Object.freeze({
+  'checkout-service': Object.freeze({
+    service: 'checkout-service',
+    owner: 'checkout-team',
+    dependents: Object.freeze(['payments', 'tax-service', 'frontend']),
+  }),
+  payments: Object.freeze({
+    service: 'payments',
+    owner: 'payments-team',
+    dependents: Object.freeze(['checkout-service']),
+  }),
+  'tax-service': Object.freeze({
+    service: 'tax-service',
+    owner: 'pricing-team',
+    dependents: Object.freeze(['checkout-service']),
+  }),
+  frontend: Object.freeze({
+    service: 'frontend',
+    owner: 'web-team',
+    dependents: Object.freeze(['checkout-service']),
+  }),
+  'search-service': Object.freeze({
+    service: 'search-service',
+    owner: 'search-team',
+    dependents: Object.freeze(['indexing']),
+  }),
+  indexing: Object.freeze({
+    service: 'indexing',
+    owner: 'search-team',
+    dependents: Object.freeze(['search-service']),
+  }),
+});

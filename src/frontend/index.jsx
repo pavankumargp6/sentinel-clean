@@ -2,10 +2,12 @@ import React, { useEffect, useState } from 'react';
 import ForgeReconciler, {
   Badge,
   Button,
+  CodeBlock,
   DynamicTable,
   SectionMessage,
   Strong,
   Text,
+  TextArea,
 } from '@forge/react';
 import { invoke } from '@forge/bridge';
 
@@ -29,6 +31,70 @@ const HYPOTHESIS_TABLE_HEAD = {
     {
       key: 'evidence',
       content: 'Evidence Cited',
+      isSortable: true,
+      shouldTruncate: true,
+    },
+  ],
+};
+
+const EVIDENCE_HEAD = {
+  cells: [
+    { key: 'fact', content: 'Fact', isSortable: true },
+    { key: 'stance', content: 'Stance', isSortable: true },
+    { key: 'role', content: 'Role', isSortable: true },
+  ],
+};
+
+const BLAST_RADIUS_HEAD = {
+  cells: [
+    { key: 'service', content: 'Service', isSortable: true },
+    { key: 'owner', content: 'Owner', isSortable: true },
+    {
+      key: 'dependents',
+      content: 'Dependents',
+      isSortable: true,
+      shouldTruncate: true,
+    },
+  ],
+};
+
+const AUDIT_HEAD = {
+  cells: [
+    { key: 'decision', content: 'Decision', isSortable: true },
+    {
+      key: 'decided_at',
+      content: 'Decided At',
+      isSortable: true,
+      shouldTruncate: true,
+    },
+    {
+      key: 'decided_by',
+      content: 'Decided By',
+      isSortable: true,
+      shouldTruncate: true,
+    },
+    {
+      key: 'proposal_id',
+      content: 'Proposal',
+      isSortable: true,
+      shouldTruncate: true,
+    },
+    {
+      key: 'hypothesis_id',
+      content: 'Hypothesis',
+      isSortable: true,
+      shouldTruncate: true,
+    },
+    { key: 'confidence', content: 'Confidence', isSortable: true },
+    {
+      key: 'evidence',
+      content: 'Evidence',
+      isSortable: true,
+      shouldTruncate: true,
+    },
+    {
+      key: 'note',
+      content: 'Note',
       isSortable: true,
       shouldTruncate: true,
     },
@@ -144,6 +210,71 @@ function toHypothesisRows(hypotheses) {
   });
 }
 
+function evidenceRows(citations) {
+  if (!Array.isArray(citations) || citations.length === 0) {
+    return [];
+  }
+
+  return citations.map((citation, index) => ({
+    key: `evidence:${citation.fact_id ?? index}`,
+    cells: [
+      { key: `evidence:${index}:fact`, content: citation.fact_id },
+      { key: `evidence:${index}:stance`, content: citation.stance },
+      { key: `evidence:${index}:role`, content: citation.role },
+    ],
+  }));
+}
+
+function blastRadiusRows(blastRadius) {
+  if (!Array.isArray(blastRadius) || blastRadius.length === 0) {
+    return [];
+  }
+
+  return blastRadius.map((entry, index) => ({
+    key: `blast:${entry.service ?? index}`,
+    cells: [
+      { key: `blast:${index}:service`, content: entry.service },
+      { key: `blast:${index}:owner`, content: entry.owner },
+      {
+        key: `blast:${index}:dependents`,
+        content: Array.isArray(entry.dependents)
+          ? entry.dependents.join(', ')
+          : '',
+      },
+    ],
+  }));
+}
+
+function auditRows(audits) {
+  if (!Array.isArray(audits) || audits.length === 0) {
+    return [];
+  }
+
+  return audits.map((audit, index) => ({
+    key: `audit:${audit.audit_id ?? index}`,
+    cells: [
+      { key: `audit:${index}:decision`, content: audit.decision },
+      { key: `audit:${index}:decided_at`, content: audit.decided_at },
+      { key: `audit:${index}:decided_by`, content: audit.decided_by },
+      { key: `audit:${index}:proposal_id`, content: audit.proposal_id },
+      { key: `audit:${index}:hypothesis_id`, content: audit.hypothesis_id },
+      {
+        key: `audit:${index}:confidence`,
+        content: Number.isFinite(audit.confidence_at_decision)
+          ? audit.confidence_at_decision.toFixed(2)
+          : '0.00',
+      },
+      {
+        key: `audit:${index}:evidence`,
+        content: Array.isArray(audit.evidence_fact_ids)
+          ? audit.evidence_fact_ids.join(', ')
+          : '',
+      },
+      { key: `audit:${index}:note`, content: audit.note ?? '' },
+    ],
+  }));
+}
+
 function messageFor(error) {
   return error && error.message ? error.message : String(error);
 }
@@ -159,9 +290,15 @@ const App = () => {
   const [facts, setFacts] = useState([]);
   const [hypotheses, setHypotheses] = useState([]);
   const [engineRun, setEngineRun] = useState(null);
+  const [proposalRun, setProposalRun] = useState(null);
+  const [auditLog, setAuditLog] = useState([]);
+  const [decision, setDecision] = useState(null);
+  const [decisionNote, setDecisionNote] = useState('');
   const [message, setMessage] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isEngineLoading, setIsEngineLoading] = useState(false);
+  const [isProposalLoading, setIsProposalLoading] = useState(false);
+  const [isDecisionLoading, setIsDecisionLoading] = useState(false);
 
   const readLedger = async () => {
     const result = await invoke('getLedger');
@@ -171,6 +308,20 @@ const App = () => {
       );
     }
     return Array.isArray(result.facts) ? result.facts : [];
+  };
+
+  const loadAuditLog = async () => {
+    try {
+      const result = await invoke('getAuditLog');
+      if (!result || result.status !== 'SUCCESS') {
+        throw new Error(
+          (result && result.message) || 'getAuditLog did not return an audit log.',
+        );
+      }
+      setAuditLog(Array.isArray(result.audits) ? result.audits : []);
+    } catch (error) {
+      console.warn('getAuditLog failed:', messageFor(error));
+    }
   };
 
   // Load once on mount so a page refresh shows whatever is already in storage.
@@ -217,6 +368,8 @@ const App = () => {
       }
     })();
 
+    loadAuditLog();
+
     return () => {
       active = false;
     };
@@ -236,6 +389,9 @@ const App = () => {
       setFacts(nextFacts);
       setHypotheses([]);
       setEngineRun(null);
+      setProposalRun(null);
+      setDecision(null);
+      setDecisionNote('');
       setMessage({
         appearance: 'success',
         title: 'Demo scenario loaded',
@@ -266,6 +422,9 @@ const App = () => {
       setFacts(nextFacts);
       setHypotheses([]);
       setEngineRun(null);
+      setProposalRun(null);
+      setDecision(null);
+      setDecisionNote('');
       setMessage({
         appearance: 'success',
         title: 'Demo data reset',
@@ -286,6 +445,9 @@ const App = () => {
     setIsEngineLoading(true);
     setMessage(null);
     setEngineRun(null);
+    setProposalRun(null);
+    setDecision(null);
+    setDecisionNote('');
     try {
       const result = await invoke('generateHypotheses');
       if (
@@ -331,7 +493,78 @@ const App = () => {
     }
   };
 
-  const isBusy = isLoading || isEngineLoading;
+  const handleGetProposal = async () => {
+    setIsProposalLoading(true);
+    setMessage(null);
+    setProposalRun(null);
+    setDecision(null);
+    setDecisionNote('');
+    try {
+      const result = await invoke('getProposal');
+      if (!result || result.status !== 'SUCCESS') {
+        throw new Error(
+          (result && result.message) || 'getProposal did not complete.',
+        );
+      }
+
+      setProposalRun(result);
+      setMessage({
+        appearance: result.proposal ? 'success' : 'warning',
+        title: result.proposal ? 'Remediation proposal ready' : 'No proposal',
+        text: result.proposal
+          ? `Proposed ${result.proposal.action} for ${result.proposal.target}.`
+          : result.reason || 'No qualifying hypothesis.',
+      });
+    } catch (error) {
+      setMessage({
+        appearance: 'error',
+        title: 'Proposal failed',
+        text: messageFor(error),
+      });
+    } finally {
+      setIsProposalLoading(false);
+    }
+  };
+
+  const handleDecision = async (value) => {
+    if (!proposalRun || !proposalRun.proposal) {
+      return;
+    }
+
+    setIsDecisionLoading(true);
+    setMessage(null);
+    try {
+      const result = await invoke('recordDecision', {
+        proposal_id: proposalRun.proposal.proposal_id,
+        decision: value,
+        note: decisionNote,
+      });
+      if (!result || result.status !== 'SUCCESS') {
+        throw new Error(
+          (result && result.message) || 'recordDecision did not complete.',
+        );
+      }
+
+      setDecision(value);
+      setMessage({
+        appearance: 'success',
+        title: `Proposal ${value === 'approve' ? 'approved' : 'rejected'}`,
+        text: `Audit record ${result.audit.audit_id} written.`,
+      });
+      await loadAuditLog();
+    } catch (error) {
+      setMessage({
+        appearance: 'error',
+        title: 'Decision failed',
+        text: messageFor(error),
+      });
+    } finally {
+      setIsDecisionLoading(false);
+    }
+  };
+
+  const isBusy =
+    isLoading || isEngineLoading || isProposalLoading || isDecisionLoading;
 
   return (
     <>
@@ -414,6 +647,105 @@ const App = () => {
         rows={toHypothesisRows(hypotheses)}
         isLoading={isEngineLoading}
         emptyView="No hypotheses scored yet. Click Run Hypothesis Engine."
+      />
+
+      <Strong>Remediation Proposal</Strong>
+      <Text>
+        Builds a human-executed proposal from the top-ranked hypothesis. The app
+        does not perform rollbacks or restarts; it records the decision in an
+        audit log.
+      </Text>
+
+      <Button
+        appearance="primary"
+        onClick={handleGetProposal}
+        isDisabled={isBusy}
+      >
+        Get Remediation Proposal
+      </Button>
+      {isProposalLoading && <Text>Building proposal…</Text>}
+
+      {proposalRun && !proposalRun.proposal && (
+        <SectionMessage appearance="warning" title="No proposal">
+          <Text>{proposalRun.reason || 'insufficient evidence'}</Text>
+        </SectionMessage>
+      )}
+
+      {proposalRun && proposalRun.proposal && (
+        <SectionMessage appearance="information" title="Remediation Proposal">
+          <Text>
+            {`Action: ${proposalRun.proposal.action || 'unknown'} · Target: ${proposalRun.proposal.target || 'unknown'} · Confidence: ${formatConfidence(
+              proposalRun.top_hypothesis
+                ? proposalRun.top_hypothesis.confidence
+                : 0,
+            )}`}
+          </Text>
+          <Text>
+            {proposalRun.top_hypothesis
+              ? proposalRun.top_hypothesis.summary
+              : ''}
+          </Text>
+          <Text>Evidence cited:</Text>
+          <DynamicTable
+            caption="Proposal evidence"
+            head={EVIDENCE_HEAD}
+            rows={evidenceRows(
+              proposalRun.top_hypothesis
+                ? proposalRun.top_hypothesis.citations
+                : [],
+            )}
+            emptyView="No evidence cited."
+          />
+          <Text>Blast radius (seeded demo data):</Text>
+          <DynamicTable
+            caption="Blast radius"
+            head={BLAST_RADIUS_HEAD}
+            rows={blastRadiusRows(proposalRun.proposal.blast_radius)}
+            emptyView="No blast radius data for this target."
+          />
+          <Text>Human-executed instructions:</Text>
+          <CodeBlock
+            text={proposalRun.proposal.instructions || ''}
+            language="text"
+          />
+          <Text>Text diff / rollback instructions:</Text>
+          <CodeBlock text={proposalRun.proposal.diff || ''} language="text" />
+          <Text>Note (optional):</Text>
+          <TextArea
+            name="decision-note"
+            placeholder="Add a note for the audit log"
+            value={decisionNote}
+            onChange={(event) =>
+              setDecisionNote(event && event.target ? event.target.value : '')
+            }
+            isDisabled={decision !== null || isDecisionLoading}
+            minimumRows={3}
+          />
+          <Button
+            appearance="primary"
+            onClick={() => handleDecision('approve')}
+            isDisabled={decision !== null || isDecisionLoading}
+          >
+            Approve
+          </Button>
+          <Button
+            appearance="danger"
+            onClick={() => handleDecision('reject')}
+            isDisabled={decision !== null || isDecisionLoading}
+          >
+            Reject
+          </Button>
+          {decision && <Text>{`Decision recorded: ${decision}`}</Text>}
+        </SectionMessage>
+      )}
+
+      <Strong>Audit Log</Strong>
+      <DynamicTable
+        caption="Audit log"
+        head={AUDIT_HEAD}
+        rows={auditRows(auditLog)}
+        isLoading={isDecisionLoading}
+        emptyView="No decisions recorded yet."
       />
     </>
   );
