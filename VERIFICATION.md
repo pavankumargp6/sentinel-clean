@@ -475,7 +475,7 @@ Notes:
 
 ## 8. LLM truncation fix, salvage, and one-run proposals (Session 7)
 - **Date:** Nov 25, 2026
-- **Scope:** Fix the live `Unterminated string in JSON at position 2490` fallback and make the proposal read the same scored run as the hypothesis table. No postmortem, MCP, Rovo, external API, deploy, or install was run. No manifest, scope, or egress change.
+- **Scope:** Fix the live `Unterminated string in JSON at position 2490` fallback and make the proposal read the same scored run as the hypothesis table. No postmortem, MCP, Rovo, external API, or install was run. The app was deployed to `development` as version `5.4.0`; no manifest, scope, or egress change.
 
 ### Task A: truncation diagnosis
 - `src/llm.js` set `MAX_COMPLETION_TOKENS = 800`. The observed failure cut the JSON at character 2490 with `Unterminated string in JSON`, which is the signature of an output-token stop mid-string. The 800-token cap was the likely cause.
@@ -528,14 +528,20 @@ Notes:
 - `forge login`: did not persist credentials because `libsecret` is unavailable in WSL (`The CLI couldn't securely store your login credentials in a local keychain...`). Authentication was still available for the lint and deploy commands in that shell. Do not put the API token in the repo; use `libsecret` or the documented `FORGE_EMAIL` / `FORGE_API_TOKEN` environment variables in a future shell if needed.
 - No manifest, scope, or egress change was made, so no `--approve` was required and `forge install --upgrade` is not required.
 
-### UI and live-model acceptance (not yet verified)
-- **UNVERIFIED** — deploy is live (version `5.4.0`); browser test pending:
-  - A successful model run completes without the position-2479/2490 truncation and shows `Source: LLM (claude-sonnet-4-6)`.
-  - A truncated response either retries successfully or shows the exact fallback reason plus `Source: Mock (fallback)`.
-  - The proposal card matches the hypothesis table's rank-1 summary, confidence, source, model, and run timestamp.
-  - `Get Remediation Proposal` before running the engine shows `Run the Hypothesis Engine first`.
-  - Load and Reset clear the stored run, and the next proposal request asks for a new run.
-  - Real model latency with the 22 s total budget remains **UNVERIFIED** until observed in a deployed run.
+### UI and live-model acceptance
+- **PASS** — live run on deployed version `5.4.0`, Nov 25, 2026:
+  - `Run Hypothesis Engine` returned `Source: LLM (claude-sonnet-4-6)` with no truncation and no fallback. Three hypotheses were scored.
+  - Rank 1 was `hyp_001`, summary `Synchronous tax calculation added in v2.14.0 introduced latency on the checkout request path.`, confidence `0.95`, corroboration `3`, with `fact_deploy_root_001`, `fact_jira_change_001`, and `fact_runbook_step_001` as causal supports and `fact_alert_001` as context.
+  - `Get Remediation Proposal` showed `Action: rollback`, `Target: checkout-service`, `Confidence: 0.95`, `Run source: LLM (claude-sonnet-4-6)`, and `Run scored at: 2026-11-25T14:00:31.374Z`.
+  - The proposal's hypothesis ID, summary, confidence, and evidence match rank 1 exactly. The old mismatched second-call proposal no longer occurs.
+  - Approving wrote audit record `audit_2026-11-25T14-00-49-010Z_mww6yhde_ogq88z_0` with proposal `proposal_hyp_001_2026-11-25T14-00-40-838Z`, hypothesis `hyp_001`, confidence `0.95`, and the same four evidence fact IDs. The Audit Log table refreshed and showed the record.
+  - The no-run state shows `No hypotheses scored yet...` and `Get Remediation Proposal` returns `Run the Hypothesis Engine first to score hypotheses.`
+  - The two earlier audit rows from the old deployment remain; append-only retention is expected.
+- **UNVERIFIED**:
+  - A live `finish_reason: "length"` retry and live truncated-JSON salvage were not exercised; both are covered only by stubbed `node:test` tests.
+  - Exact model latency was not measured. This run completed successfully, but the 22 s total budget and 3 s minimum retry budget were not stressed live.
+  - The reset-clears-the-stored-run path is consistent with the observed no-run message, but the reset action was not timed independently.
+  - The proposal evidence table shows `fact_alert_001` with stance `supports` and role `context`; scoring still gives it no causal weight. The stance label is model-provided, not a scoring change.
 
 ### Commands run for deployment
 ```bash
@@ -546,5 +552,5 @@ forge lint
 forge deploy -e development
 ```
 - `forge login` reported the keychain error above; `forge lint` and `forge deploy` still completed.
-- Remaining verification is the browser flow: hard-refresh, Load demo scenario, Run Hypothesis Engine, Get Remediation Proposal.
-- If the proposal card or retry behavior differs live, capture the logged `finish_reason`, `output_tokens`, `retry_used`, and `salvage_used` values before changing code.
+- Browser flow completed on deployed version `5.4.0`: Load demo scenario, Run Hypothesis Engine (LLM, no fallback), Get Remediation Proposal (matching rank 1), Approve (audit record written).
+- If the retry or salvage path is exercised later, capture the logged `finish_reason`, `output_tokens`, `retry_used`, and `salvage_used` values before changing code.
