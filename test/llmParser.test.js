@@ -5,6 +5,8 @@ import { buildDemoScenario } from '../src/fixtures.js';
 import {
   contentToText,
   parseHypotheses,
+  parseHypothesesDetailed,
+  salvageHypotheses,
   stripCodeFences,
   toPromptFacts,
 } from '../src/llmParser.js';
@@ -66,6 +68,64 @@ test('rejects malformed JSON so the caller can fall back', () => {
         allowedFactIds,
       }),
     /did not return valid JSON/,
+  );
+});
+
+test('salvages complete hypotheses from truncated JSON and drops the partial one', () => {
+  const first = validHypothesis({ hypothesis_id: 'hypothesis_first' });
+  const second = validHypothesis({ hypothesis_id: 'hypothesis_second' });
+  const partial =
+    '{"hypothesis_id":"hypothesis_partial","summary":"The partial one","citations":[{"hypothesis_id":"hypothesis_partial","fact_id":"fact_deploy_root_001","stance":"supp';
+  const content = `[${JSON.stringify(first)},${JSON.stringify(
+    second,
+  )},${partial}`;
+
+  const parsed = parseHypothesesDetailed(content, { allowedFactIds });
+
+  assert.equal(parsed.salvage_used, true);
+  assert.deepEqual(
+    parsed.hypotheses.map((hypothesis) => hypothesis.hypothesis_id),
+    ['hypothesis_first', 'hypothesis_second'],
+  );
+  assert.equal(parsed.hypotheses.length, 2);
+});
+
+test('does not accept a citation whose parent hypothesis is truncated', () => {
+  const complete = validHypothesis({ hypothesis_id: 'hypothesis_complete' });
+  const truncatedParent =
+    '{"hypothesis_id":"hypothesis_incomplete","summary":"Incomplete","citations":[{"hypothesis_id":"hypothesis_incomplete","fact_id":"fact_deploy_root_001","stance":"supports"}]';
+  const content = `[${JSON.stringify(complete)},${truncatedParent}`;
+
+  const parsed = parseHypothesesDetailed(content, { allowedFactIds });
+
+  assert.equal(parsed.salvage_used, true);
+  assert.deepEqual(
+    parsed.hypotheses.map((hypothesis) => hypothesis.hypothesis_id),
+    ['hypothesis_complete'],
+  );
+  assert.equal(parsed.hypotheses[0].citations.length, 1);
+});
+
+test('salvage still drops unknown and remediation fact IDs', () => {
+  const hypothesis = validHypothesis({
+    hypothesis_id: 'hypothesis_salvaged',
+    citations: [
+      citation('fact_does_not_exist_999'),
+      citation('fact_remediation_001'),
+      citation('fact_deploy_root_001'),
+    ],
+  });
+  const content = `[${JSON.stringify(hypothesis)},{"hypothesis_id":"partial"`;
+
+  const salvaged = salvageHypotheses(content, {
+    allowedFactIds: [...allowedFactIds, 'fact_remediation_001'],
+    blockedFactIds: ['fact_remediation_001'],
+  });
+
+  assert.equal(salvaged.length, 1);
+  assert.deepEqual(
+    salvaged[0].citations.map((item) => item.fact_id),
+    ['fact_deploy_root_001'],
   );
 });
 

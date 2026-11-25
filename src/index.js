@@ -9,7 +9,13 @@ import {
   rankHypotheses,
 } from './scoring.js';
 import { generateHypotheses as generateHypothesesWithLLM } from './llm.js';
-import { buildTopProposal, proposalKey } from './remediation.js';
+import { proposalKey } from './remediation.js';
+import {
+  LAST_RUN_KEY,
+  createStoredRun,
+  isStoredRun,
+  proposalFromStoredRun,
+} from './runStore.js';
 import {
   AUDIT_INDEX_KEY,
   AUDIT_INDEX_VERSION,
@@ -192,37 +198,6 @@ function citationIds(citations) {
   return Array.from(new Set(ids));
 }
 
-/**
- * Scores generated hypotheses against the full ledger and ranks them.
- *
- * getProposal uses this path so the approval card and the hypothesis table share
- * the same scoring logic. generateHypotheses keeps its existing inline path.
- */
-function scoreAndRankHypotheses(generated, facts) {
-  const scoredHypotheses = generated.hypotheses.map((hypothesis) => {
-    const scored = calculateConfidence(hypothesis, facts);
-
-    return {
-      hypothesis_id: hypothesis.hypothesis_id,
-      summary: hypothesis.summary,
-      confidence: scored.confidence,
-      insufficient_evidence: scored.insufficient_evidence,
-      corroboration: scored.corroboration,
-      causal_cluster_count: scored.causal_cluster_count,
-      citations: scored.valid_citations.map((citation) => ({
-        fact_id: citation.fact_id,
-        stance: citation.stance,
-        role: citation.role,
-      })),
-      valid_citation_ids: citationIds(scored.valid_citations),
-      rejected_citation_ids: citationIds(scored.rejected_citations),
-      blocked_citation_ids: citationIds(scored.blocked_citations),
-    };
-  });
-
-  return rankHypotheses(scoredHypotheses);
-}
-
 // ---------------------------------------------------------------------------
 // Existing verified handler: do not change its behavior.
 // ---------------------------------------------------------------------------
@@ -280,6 +255,10 @@ resolver.define('loadDemoScenario', async () => {
     // Rebuild the index last. If any write above failed, the previous index is
     // still intact and the next load retries from a known set of keys.
     const index = await writeIndex(facts.map((fact) => fact.fact_id));
+
+    // A new ledger invalidates the last scored run. getProposal must not use
+    // hypotheses scored against facts that no longer exist.
+    await kvs.delete(LAST_RUN_KEY);
 
     // Best-effort sweep for keys left behind by an earlier half-failed run.
     // Never delete a key that belongs to the current scenario.
@@ -376,12 +355,25 @@ resolver.define('generateHypotheses', async () => {
     // Rank in the resolver so every client sees the same order and rank.
     const hypotheses = rankHypotheses(scoredHypotheses);
 
+    // Persist the scored run so getProposal uses exactly what the user just
+    // saw. A single key is intentional: the latest run is the only run that
+    // may produce a decision.
+    const storedRun = createStoredRun({
+      hypotheses,
+      source: generated.source,
+      model: generated.model,
+      fallback_used: generated.fallback_used,
+      fallback_reason: generated.fallback_reason ?? null,
+    });
+    await kvs.set(LAST_RUN_KEY, storedRun, { keyPolicy: 'OVERRIDE' });
+
     return {
       status: 'SUCCESS',
       source: generated.source,
       model: generated.model,
       fallback_used: generated.fallback_used,
       fallback_reason: generated.fallback_reason ?? null,
+      run_created_at: storedRun.created_at,
       count: hypotheses.length,
       hypotheses,
     };
@@ -400,25 +392,28 @@ resolver.define('getProposal', async () => {
     const { facts, missing } = await readLedgerFacts();
     warnAboutMissing('getProposal', missing);
 
-    const filteredFacts = applyCausalInversionGuard(facts);
-    const blockedFactIds = facts
-      .filter((fact) => fact.fact_type === 'remediation_action')
-      .map((fact) => fact.fact_id);
-    const generated = await generateHypothesesWithLLM(
-      filteredFacts,
-      blockedFactIds,
-    );
-    const hypotheses = scoreAndRankHypotheses(generated, facts);
-    const topHypothesis =
-      hypotheses.find((hypothesis) => hypothesis.rank === 1) ||
-      hypotheses[0] ||
-      null;
+    // One run, one truth: getProposal must not call the model again. It reads
+    // the ranked run saved by generateHypotheses, so the approval card cannot
+    // disagree with the hypothesis table the user just saw.
+    const storedRun = await kvs.get(LAST_RUN_KEY);
+    if (!isStoredRun(storedRun)) {
+      return {
+        status: 'SUCCESS',
+        proposal: null,
+        reason: 'Run the Hypothesis Engine first to score hypotheses.',
+        needs_run: true,
+        source: null,
+        model: null,
+        fallback_used: false,
+        fallback_reason: null,
+        run_created_at: null,
+        top_hypothesis: null,
+      };
+    }
 
     const now = Date.now();
-    const { proposal, reason } = buildTopProposal(hypotheses, {
-      facts,
-      now,
-    });
+    const { proposal, reason, top_hypothesis: topHypothesis } =
+      proposalFromStoredRun(storedRun, { facts, now });
 
     // Store the proposal so recordDecision can audit it without requiring the
     // client to echo the full proposal back. The proposal is not an audit
@@ -439,10 +434,12 @@ resolver.define('getProposal', async () => {
       status: 'SUCCESS',
       proposal,
       reason: reason ?? null,
-      source: generated.source,
-      model: generated.model,
-      fallback_used: generated.fallback_used,
-      fallback_reason: generated.fallback_reason ?? null,
+      needs_run: false,
+      source: storedRun.source,
+      model: storedRun.model,
+      fallback_used: storedRun.fallback_used,
+      fallback_reason: storedRun.fallback_reason,
+      run_created_at: storedRun.created_at,
       top_hypothesis: topHypothesis,
     };
   } catch (error) {
@@ -600,6 +597,10 @@ resolver.define('resetDemoData', async () => {
     // Delete the index last. If a delete above failed, the index is still
     // present so another reset can find the remaining keys.
     await kvs.delete(INDEX_KEY);
+
+    // The scored run belonged to the cleared ledger; remove it so getProposal
+    // asks the user to run the engine again.
+    await kvs.delete(LAST_RUN_KEY);
 
     return { status: 'SUCCESS', cleared };
   } catch (error) {

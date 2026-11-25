@@ -510,7 +510,11 @@ const App = () => {
       setProposalRun(result);
       setMessage({
         appearance: result.proposal ? 'success' : 'warning',
-        title: result.proposal ? 'Remediation proposal ready' : 'No proposal',
+        title: result.proposal
+          ? 'Remediation proposal ready'
+          : result.needs_run
+            ? 'Run the Hypothesis Engine first'
+            : 'No proposal',
         text: result.proposal
           ? `Proposed ${result.proposal.action} for ${result.proposal.target}.`
           : result.reason || 'No qualifying hypothesis.',
@@ -666,7 +670,14 @@ const App = () => {
       {isProposalLoading && <Text>Building proposal…</Text>}
 
       {proposalRun && !proposalRun.proposal && (
-        <SectionMessage appearance="warning" title="No proposal">
+        <SectionMessage
+          appearance="warning"
+          title={
+            proposalRun.needs_run
+              ? 'Run the Hypothesis Engine first'
+              : 'No proposal'
+          }
+        >
           <Text>{proposalRun.reason || 'insufficient evidence'}</Text>
         </SectionMessage>
       )}
@@ -680,6 +691,23 @@ const App = () => {
                 : 0,
             )}`}
           </Text>
+          <Text>
+            {`Run source: ${sourceLabel(proposalRun)}${
+              proposalRun.source === 'llm' && proposalRun.model
+                ? ` (${proposalRun.model})`
+                : ''
+            }`}
+          </Text>
+          {proposalRun.fallback_used && (
+            <Text>
+              {`Fallback reason: ${
+                proposalRun.fallback_reason || 'unknown'
+              }`}
+            </Text>
+          )}
+          {proposalRun.run_created_at && (
+            <Text>{`Run scored at: ${proposalRun.run_created_at}`}</Text>
+          )}
           <Text>
             {proposalRun.top_hypothesis
               ? proposalRun.top_hypothesis.summary

@@ -472,3 +472,79 @@ Notes:
 - `forge login` is interactive; complete it in your terminal.
 - No scope changed, so `--approve` is not expected and `forge install --upgrade` is not required.
 - `forge lint` and `forge deploy -e development` were deliberately not run because the CLI is not authenticated on this machine.
+
+## 8. LLM truncation fix, salvage, and one-run proposals (Session 7)
+- **Date:** Nov 25, 2026
+- **Scope:** Fix the live `Unterminated string in JSON at position 2490` fallback and make the proposal read the same scored run as the hypothesis table. No postmortem, MCP, Rovo, external API, deploy, or install was run. No manifest, scope, or egress change.
+
+### Task A: truncation diagnosis
+- `src/llm.js` set `MAX_COMPLETION_TOKENS = 800`. The observed failure cut the JSON at character 2490 with `Unterminated string in JSON`, which is the signature of an output-token stop mid-string. The 800-token cap was the likely cause.
+- The documented `@forge/llm` shape exposes `ChatResponse.choices[0].finish_reason` and an optional `usage` object (`node_modules/@forge/llm/out/interfaces/internal.d.ts`). A truncated response is therefore detectable as `finish_reason: "length"` (the code also treats `max_tokens` and `max_output_tokens` defensively).
+- Output budget estimate for 3 hypotheses with up to 5 citations each: roughly 600-800 tokens including JSON field names, IDs, and summaries. 800 was marginal; 2000 gives ample headroom while staying well inside `claude-sonnet-4-6` limits (model is ACTIVE; Anthropic documents 1M context / 128K max output).
+- Timeout: `LLM_TIMEOUT_MS` stayed at 15000 ms per attempt. A new total model-phase budget of `LLM_TOTAL_BUDGET_MS = 22000` covers the first attempt plus the one retry, keeping the whole resolver under its 25 s limit.
+
+### Changes
+- `src/llm.js`:
+  - `MAX_COMPLETION_TOKENS = 2000`.
+  - Compact prompt: exactly 3 hypotheses, summaries at most 25 words, at most 4 citations per hypothesis, no extra fields, no confidence.
+  - A second, tighter retry prompt: exactly 2 hypotheses, summaries at most 20 words, at most 3 citations.
+  - Forge `chat` is injected into `src/llmRun.js`; fallback still returns the deterministic mock but now carries `fallback_reason` (capped at 500 chars) for the UI.
+  - Logs `finish_reason`, `output_tokens`, `retry_used`, and `salvage_used` on successful model runs, without secrets.
+- Added `src/llmRun.js` (pure, no Forge imports):
+  - `finishReasonOf` / `isTruncationFinish` / `usageOf` read the documented response fields.
+  - `runChatWithRetry` retries once only on a truncation finish reason; it skips the retry when less than 3000 ms of the total budget remain, and keeps salvaged first-attempt hypotheses if the retry fails.
+  - `generateHypothesesWithChat` converts terminal failures into the caller's fallback result.
+- `src/llmParser.js`:
+  - Parser caps are now 3 hypotheses and 4 citations per hypothesis.
+  - Added `parseHypothesesDetailed` and `salvageHypotheses`, plus a balanced-object scanner that respects quoted strings and escapes.
+  - Truncated JSON keeps complete hypothesis objects and drops a partial hypothesis; an incomplete citation is never accepted without its closed parent object.
+  - Unknown and blocked/remediation `fact_id` filtering is unchanged and still applies to salvaged objects.
+- Added `src/runStore.js` (pure):
+  - `LAST_RUN_KEY = 'sentinel:last_run'`, version 1.
+  - `createStoredRun` stores `{ version, created_at, source, model, fallback_used, fallback_reason, hypotheses, count }`.
+  - `isStoredRun` validates a KVS read; `proposalFromStoredRun` builds the proposal from the stored rank-1 hypothesis without calling the model or re-ranking.
+- `src/index.js`:
+  - `generateHypotheses` writes the ranked run to `LAST_RUN_KEY` and returns `run_created_at`.
+  - `getProposal` reads `LAST_RUN_KEY` instead of calling the LLM; without a run it returns `needs_run: true` and `Run the Hypothesis Engine first to score hypotheses.`
+  - Load and Reset delete `LAST_RUN_KEY` so a proposal cannot outlive its ledger.
+  - Removed the now-unused `scoreAndRankHypotheses` helper and the `buildTopProposal` import.
+- `src/frontend/index.jsx`:
+  - Proposal card shows the run source (LLM + model, or Mock), the fallback reason when present, and the run timestamp.
+  - A missing run shows `Run the Hypothesis Engine first`.
+
+### Local checks
+- `npm test` (Node 22.23.4): **PASS** — 49 tests, 49 passed, 0 failed.
+  - 35 pre-existing tests plus 14 new: 6 in `test/llmRun.test.js`, 5 in `test/runStore.test.js`, and 3 salvage tests in `test/llmParser.test.js`.
+  - New coverage: finish-reason classification; `finish_reason: "length"` triggers exactly one retry with the tighter request; repeated truncation falls back with the exact reason; fully malformed JSON falls back without a retry; truncated JSON keeps complete hypotheses and drops the partial one; a citation whose parent is truncated is not accepted; salvage still drops unknown and remediation IDs; the stored-run shape validates; the proposal builder uses the stored rank-1 hypothesis; a missing run asks for the engine first.
+  - No test used the network; `chat` was stubbed in every retry test.
+- `npm run lint`: **PASS** (exit 0).
+- `npx eslint test/llmRun.test.js test/runStore.test.js test/llmParser.test.js`: **PASS** (exit 0).
+- `node --check` on `src/llm.js`, `src/llmRun.js`, `src/llmParser.js`, `src/runStore.js`, `src/index.js`: **PASS**.
+- Confirmed no stale `scoreAndRankHypotheses` or `buildTopProposal` references remain in `src/index.js`.
+
+### Forge checks
+- `forge lint`: **UNVERIFIED** — blocked by CLI authentication (`Error: Not logged in...`). CLI version `15.0.0`; update `15.1.0` available but not installed.
+- `forge deploy -e development`: **UNVERIFIED** — not run, per instruction, and requires Forge login.
+- No manifest, scope, or egress change was made, so no `--approve` is expected and `forge install --upgrade` is not required.
+
+### UI and live-model acceptance (not yet verified)
+- **UNVERIFIED** — requires deploy + install + browser test:
+  - A successful model run completes without the position-2490 truncation and shows `Source: LLM (claude-sonnet-4-6)`.
+  - A truncated response either retries successfully or shows the exact fallback reason plus `Source: Mock (fallback)`.
+  - The proposal card matches the hypothesis table's rank-1 summary, confidence, source, model, and run timestamp.
+  - `Get Remediation Proposal` before running the engine shows `Run the Hypothesis Engine first`.
+  - Load and Reset clear the stored run, and the next proposal request asks for a new run.
+  - Real model latency with the 22 s total budget remains **UNVERIFIED** until observed in a deployed run.
+
+### Exact commands to finish verification (not run)
+```bash
+cd ~/sentinel-clean
+source ~/.nvm/nvm.sh && nvm use 22.23.4
+forge login
+forge lint
+forge deploy -e development
+```
+Notes:
+- `forge login` is interactive; complete it in your terminal.
+- `forge deploy` was deliberately not run and is the only remaining step for live verification.
+- If the proposal card or retry behavior differs live, capture the logged `finish_reason`, `output_tokens`, `retry_used`, and `salvage_used` values before changing code.
