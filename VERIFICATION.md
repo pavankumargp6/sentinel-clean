@@ -523,20 +523,21 @@ Notes:
 - Confirmed no stale `scoreAndRankHypotheses` or `buildTopProposal` references remain in `src/index.js`.
 
 ### Forge checks
-- `forge lint`: **UNVERIFIED** — blocked by CLI authentication (`Error: Not logged in...`). CLI version `15.0.0`; update `15.1.0` available but not installed.
-- `forge deploy -e development`: **UNVERIFIED** — not run, per instruction, and requires Forge login.
-- No manifest, scope, or egress change was made, so no `--approve` is expected and `forge install --upgrade` is not required.
+- `forge lint`: **PASS** — `No issues found.` (Forge CLI `15.0.0`, Node `22.23.4`, Nov 25, 2026).
+- `forge deploy -e development`: **PASS** — `sentinel-clean` version `5.4.0` deployed to `development`. The deploy ran `forge lint` again and reported no issues.
+- `forge login`: did not persist credentials because `libsecret` is unavailable in WSL (`The CLI couldn't securely store your login credentials in a local keychain...`). Authentication was still available for the lint and deploy commands in that shell. Do not put the API token in the repo; use `libsecret` or the documented `FORGE_EMAIL` / `FORGE_API_TOKEN` environment variables in a future shell if needed.
+- No manifest, scope, or egress change was made, so no `--approve` was required and `forge install --upgrade` is not required.
 
 ### UI and live-model acceptance (not yet verified)
-- **UNVERIFIED** — requires deploy + install + browser test:
-  - A successful model run completes without the position-2490 truncation and shows `Source: LLM (claude-sonnet-4-6)`.
+- **UNVERIFIED** — deploy is live (version `5.4.0`); browser test pending:
+  - A successful model run completes without the position-2479/2490 truncation and shows `Source: LLM (claude-sonnet-4-6)`.
   - A truncated response either retries successfully or shows the exact fallback reason plus `Source: Mock (fallback)`.
   - The proposal card matches the hypothesis table's rank-1 summary, confidence, source, model, and run timestamp.
   - `Get Remediation Proposal` before running the engine shows `Run the Hypothesis Engine first`.
   - Load and Reset clear the stored run, and the next proposal request asks for a new run.
   - Real model latency with the 22 s total budget remains **UNVERIFIED** until observed in a deployed run.
 
-### Exact commands to finish verification (not run)
+### Commands run for deployment
 ```bash
 cd ~/sentinel-clean
 source ~/.nvm/nvm.sh && nvm use 22.23.4
@@ -544,7 +545,6 @@ forge login
 forge lint
 forge deploy -e development
 ```
-Notes:
-- `forge login` is interactive; complete it in your terminal.
-- `forge deploy` was deliberately not run and is the only remaining step for live verification.
+- `forge login` reported the keychain error above; `forge lint` and `forge deploy` still completed.
+- Remaining verification is the browser flow: hard-refresh, Load demo scenario, Run Hypothesis Engine, Get Remediation Proposal.
 - If the proposal card or retry behavior differs live, capture the logged `finish_reason`, `output_tokens`, `retry_used`, and `salvage_used` values before changing code.
