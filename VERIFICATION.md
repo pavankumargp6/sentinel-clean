@@ -655,3 +655,88 @@ Notes:
 - `forge login` is interactive; complete it in your terminal.
 - No manifest, scope, or egress changed, so no `--approve` or `forge install --upgrade` is expected.
 - After deploy, run the UI acceptance checklist above and record the live benchmark metrics.
+
+## 10. Session 8b: postmortem fix, prompt hardening, benchmark overhaul, remediation trap (Nov 26, 2026)
+
+### Scope
+- Postmortem confidence fix; LLM prompt hardening (distinctness, cross-cluster, contradiction citation, no unsupported claims); benchmark source metadata, not-evaluated exclusion, running tallies, Source/Tally UI columns, runs counter; fifth `bench_rollback_trap` scenario with remediation-bait citation blocked and counted; scoring scope-aware contradiction review (proposal only, not applied).
+- No MCP, Rovo, Confluence. No scope/egress change. No `forge deploy`.
+
+### Changes
+- **`src/postmortem.js`**: Root Cause Markdown now reads `rootCause.confidence` (already correct in structured `root_cause`), matching Summary confidence.
+- **`test/postmortem.test.js`**: Added regression test asserting Summary and Root Cause Markdown confidence are identical.
+- **`src/llm.js`**: Hardened `SYSTEM_PROMPT` and `RETRY_SYSTEM_PROMPT`:
+  - Require exactly 3 distinct hypotheses (2 on retry).
+  - At least one hypothesis must attribute the incident to a different service/cluster.
+  - Every weakening fact must be cited as `"contradicts"`; never omit contradictions.
+  - Forbid claims about components not mentioned by any cited fact.
+- **`src/benchmark.js`**:
+  - Added `normalizeGeneratorResult`: raw array → `source: 'llm'`, object with `source/fallback_used` → proper `source_label` (`LLM` / `Mock fallback`).
+  - `evaluateScenario`: mock fallbacks set `evaluated: false`, `passed: null`, `top1_correct: null`, `top3_correct: null`, `not_evaluated_reason`.
+  - `summarizeBenchmarkResults`: filters `evaluated === false` from accuracy denominators; returns `evaluated_scenario_count`, `not_evaluated_count`, `null` accuracies when nothing evaluated.
+  - Exported `updateBenchmarkTallies(previous, results)`: accumulates `runs`, per-scenario `{passed, evaluated, not_evaluated}` for the `bench_clear 3/3` display form.
+- **`src/fixtures.js`**: Added `bench_rollback_trap` — remediation action 4 min before alert, higher weight than true deploy; ground truth is the older deploy. Citation to the rollback is blocked and counted by the scorer.
+- **`src/index.js`**: Live `runBenchmark` now passes full scenario facts (including remediation) to the model with empty `blockedFactIds` so the trap citation reaches the scorer; mock fallbacks are returned instead of thrown.
+- **`src/frontend/index.jsx`**:
+  - Benchmark table: added Source column (`LLM` / `Mock fallback`), Result badge `Not evaluated` for mock fallbacks, Tally column (`bench_clear 3/3 (+0 not evaluated)`).
+  - Metrics: `Scenarios evaluated`, `Scenarios passed: X/Y evaluated`, `Not evaluated (mock fallback): Z`, `Benchmark runs completed: N`.
+  - Text: "Runs five synthetic scenarios".
+- **`test/benchmark.test.js`**:
+  - Five-scenario ground-truth checks.
+  - Mock-fallback exclusion: `evaluated: false`, `top1_accuracy` uses only evaluated results, `not_evaluated_count`.
+  - Tally test: `updateBenchmarkTallies` increments `runs`, `passed/evaluated` for LLM results, `not_evaluated` for mock fallbacks.
+  - Rollback-trap test: generator cites remediation → blocked, confidence 0, `remediation_citations_blocked: 1`; generator cites both remediation + true deploy → passes, remediation still blocked and counted.
+- **`test/postmortem.test.js`**: Confidence-match regression test (Summary and Root Cause Markdown confidence identical).
+
+### Local checks
+- `npm test` (Node `22.23.4`): **PASS** — 77 tests (was 71; +6 new: 1 postmortem regression, 5 benchmark: mock exclusion, tallies, new scenario shape, rollback-trap blocked/counted).
+- `npm run lint`: **PASS**.
+- `node --check` on all modified `src/**/*.js`: **PASS**.
+- `git diff --check`: **PASS**.
+
+### Scoring Review — Item 3 Proposal (PROPOSED, NOT APPLIED)
+**Question:** Should a contradicting fact from a different service scope than the hypothesis target count at reduced strength?
+
+**Analysis:**
+- Current formula: `confidence = support * (1 - contradiction)`, where both support and contradiction combine across clusters via noisy-OR.
+- Hypothetical 0.5× discount on cross-scope contradiction weights:
+  - Live `0.95` (support `0.9544`, no contradiction): unchanged.
+  - Live `0.69` (support `0.9544`, contradiction `0.28`): becomes `0.82` (worsens decoy penalty).
+  - Live/mock `0.63` (support `0.88`, contradiction `0.28`): becomes `0.76`.
+  - Mock `0.63` (support `0.28`, contradiction `0.88`): becomes `0.76` (artificially inflates wrong hypothesis).
+  - Mock `0.03` (support `0.28`, contradiction `0.88`): becomes `0.16`.
+
+**Recommendation:** **Keep full contradiction weight; do not apply scope discount.**
+- A contradicting fact from another service (e.g., a search deploy while checkout fails) is evidence *against* the hypothesis targeting checkout; reducing its strength defeats its purpose.
+- The prompt hardening ("cite every weakening fact as contradicts") ensures the model surfaces these contradictions; the deterministic scorer applies them at full strength. This is the correct, safer behavior.
+
+### Forge checks
+- `forge lint`: **UNVERIFIED** — blocked by CLI auth in this shell (same as Session 8).
+- `forge deploy`: **UNVERIFIED** — deliberately not run; no manifest/scope/egress changes.
+- `forge install --upgrade`: not required.
+
+### UI and live-model acceptance (not yet verified)
+- **UNVERIFIED** — requires deploy + install + browser test:
+  - `Generate Postmortem` renders Markdown with Summary/Root Cause confidence match.
+  - Benchmark table shows Source (`LLM` / `Mock fallback`), Result (`Pass` / `Fail` / `Not evaluated`), Tally (`bench_clear 3/3`), runs counter.
+  - Five scenarios including `bench_rollback_trap` complete; remediation citations blocked and counted.
+  - Mock fallback scenarios show `Not evaluated` and are excluded from accuracy.
+  - Live model accuracy, latency, billing remain **UNVERIFIED**; tests use stubs only.
+
+### Exact commands for final verification
+```bash
+cd ~/sentinel-clean
+source ~/.nvm/nvm.sh && nvm use 22.23.4
+npm test
+npm run lint
+node --check src/index.js src/benchmark.js src/fixtures.js src/llm.js src/postmortem.js
+git diff --check
+forge login
+forge lint
+forge deploy --non-interactive -e development
+```
+
+### UNVERIFIED items
+- Forge lint, deploy, install, and browser acceptance.
+- Live model benchmark accuracy on the five synthetic scenarios.
+- Confluence publishing (still not implemented).

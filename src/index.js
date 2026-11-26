@@ -687,29 +687,18 @@ resolver.define('runBenchmark', async ({ payload } = {}) => {
       };
     }
 
-    // The benchmark generator is a thin wrapper around the real LLM. It
-    // deliberately throws when the LLM falls back to the mock so mock output
-    // can never be counted as a benchmark prediction. The wrapper returns the
-    // full LLM result shape; runBenchmark accepts either that shape or a raw
-    // hypothesis array.
-    const generate = async (scenario) => {
-      const filteredFacts = applyCausalInversionGuard(scenario.facts);
-      const blockedFactIds = scenario.facts
-        .filter((fact) => fact.fact_type === 'remediation_action')
-        .map((fact) => fact.fact_id);
-      const generated = await generateHypothesesWithLLM(
-        filteredFacts,
-        blockedFactIds,
-      );
-
-      if (generated.fallback_used || generated.source !== 'llm') {
-        throw new Error(
-          generated.fallback_reason ||
-            'Benchmark LLM call fell back to the deterministic mock; the result was discarded.',
-        );
-      }
-      return generated;
-    };
+    // The benchmark generator is a thin wrapper around the real LLM. Unlike
+    // the production hypothesis path, it deliberately passes
+    // remediation_action facts to the model so the rollback-trap scenario is
+    // observable. It also passes no parser-level blocked IDs: the facts are
+    // synthetic, and retaining a remediation citation lets the deterministic
+    // scorer block and count it instead of the parser silently dropping it.
+    // The production path still filters remediation facts before generation
+    // and passes their IDs to the parser. A mock fallback is returned
+    // normally; the benchmark marks it "not evaluated" instead of counting it
+    // as a model prediction.
+    const generate = async (scenario) =>
+      generateHypothesesWithLLM(scenario.facts, []);
 
     const scenarioRun = await runBenchmarkWithScenarios({
       scenarios: [next],

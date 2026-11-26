@@ -439,7 +439,7 @@ function rootCauseMarkdown(rootCause) {
       rootCause.top_hypothesis.summary,
     )}`,
     '',
-    `- Confidence: **${formatConfidence(rootCause.top_hypothesis.confidence)}**`,
+    `- Confidence: **${formatConfidence(rootCause.confidence)}**`,
     `- Source: **${cell(rootCause.source)}**`,
     `- Run scored at: ${cell(rootCause.run_created_at)}`,
   ];

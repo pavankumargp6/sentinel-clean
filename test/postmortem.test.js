@@ -111,6 +111,30 @@ test('postmortem contains all six required sections', () => {
   assert.ok(postmortem.root_cause.evidence.length > 0);
 });
 
+test('Summary and Root Cause Markdown report the same confidence', () => {
+  const { facts, run, proposal } = demoProposal();
+  const postmortem = buildPostmortem({ facts, run, proposal, audits: [] });
+
+  assert.equal(postmortem.summary.confidence, postmortem.root_cause.confidence);
+  assert.equal(postmortem.root_cause.confidence, run.hypotheses[0].confidence);
+
+  const summarySection = postmortem.markdown
+    .split('## Summary')[1]
+    .split('## Timeline')[0];
+  const rootCauseSection = postmortem.markdown
+    .split('## Root Cause')[1]
+    .split('## Rejected Hypotheses')[0];
+  const expected = postmortem.summary.confidence.toFixed(2);
+  const summaryMatch = summarySection.match(/\*\*Confidence:\*\* (\d+\.\d{2})/);
+  const rootMatch = rootCauseSection.match(/- Confidence: \*\*(\d+\.\d{2})\*\*/);
+
+  assert.ok(summaryMatch, 'Summary confidence line is missing');
+  assert.ok(rootMatch, 'Root Cause confidence line is missing');
+  assert.equal(summaryMatch[1], expected);
+  assert.equal(rootMatch[1], expected);
+  assert.equal(summaryMatch[1], rootMatch[1]);
+});
+
 test('timeline includes every fact sorted by observed_at, including remediation', () => {
   const { facts, run, proposal } = demoProposal();
   const postmortem = buildPostmortem({ facts, run, proposal, audits: [] });

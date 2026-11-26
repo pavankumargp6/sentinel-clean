@@ -14,6 +14,7 @@ import { invoke } from '@forge/bridge';
 import {
   BENCHMARK_LABEL,
   summarizeBenchmarkResults,
+  updateBenchmarkTallies,
 } from '../benchmark.js';
 
 const TABLE_HEAD = {
@@ -115,6 +116,12 @@ const BENCHMARK_HEAD = {
       shouldTruncate: true,
     },
     {
+      key: 'source',
+      content: 'Source',
+      isSortable: true,
+      shouldTruncate: true,
+    },
+    {
       key: 'expected',
       content: 'Expected',
       isSortable: true,
@@ -128,6 +135,7 @@ const BENCHMARK_HEAD = {
     },
     { key: 'confidence', content: 'Confidence', isSortable: true },
     { key: 'result', content: 'Result', isSortable: true },
+    { key: 'tally', content: 'Tally', isSortable: true },
   ],
 };
 
@@ -315,39 +323,66 @@ function formatAccuracy(value) {
     : 'n/a';
 }
 
-function benchmarkRows(results) {
+function benchmarkTallyLabel(tallies, scenarioId) {
+  const scenarioTallies =
+    tallies && tallies.scenarios ? tallies.scenarios : null;
+  const tally = scenarioTallies ? scenarioTallies[scenarioId] : null;
+  if (!tally) {
+    return '0/0';
+  }
+
+  const base = `${tally.passed}/${tally.evaluated}`;
+  return tally.not_evaluated > 0
+    ? `${base} (+${tally.not_evaluated} not evaluated)`
+    : base;
+}
+
+function benchmarkRows(results, tallies) {
   if (!Array.isArray(results) || results.length === 0) {
     return [];
   }
 
-  return results.map((result, index) => ({
-    key: `benchmark:${result.scenario_id ?? index}`,
-    cells: [
-      { key: `benchmark:${index}:scenario`, content: result.scenario_id },
-      { key: `benchmark:${index}:expected`, content: result.expected_label },
-      {
-        key: `benchmark:${index}:predicted`,
-        content: result.error
-          ? `${result.predicted_label} (${result.error})`
-          : result.predicted_label,
-      },
-      {
-        key: `benchmark:${index}:confidence`,
-        content:
-          typeof result.confidence === 'number'
-            ? result.confidence.toFixed(2)
-            : 'n/a',
-      },
-      {
-        key: `benchmark:${index}:result`,
-        content: (
-          <Badge appearance={result.passed ? 'success' : 'danger'}>
-            {result.passed ? 'Pass' : 'Fail'}
-          </Badge>
-        ),
-      },
-    ],
-  }));
+  return results.map((result, index) => {
+    const evaluated = result.evaluated !== false;
+    const sourceLabel =
+      result.source_label || (result.source === 'mock' ? 'Mock fallback' : 'LLM');
+
+    return {
+      key: `benchmark:${result.scenario_id ?? index}`,
+      cells: [
+        { key: `benchmark:${index}:scenario`, content: result.scenario_id },
+        { key: `benchmark:${index}:source`, content: sourceLabel },
+        { key: `benchmark:${index}:expected`, content: result.expected_label },
+        {
+          key: `benchmark:${index}:predicted`,
+          content: result.error
+            ? `${result.predicted_label} (${result.error})`
+            : result.predicted_label,
+        },
+        {
+          key: `benchmark:${index}:confidence`,
+          content:
+            typeof result.confidence === 'number'
+              ? result.confidence.toFixed(2)
+              : 'n/a',
+        },
+        {
+          key: `benchmark:${index}:result`,
+          content: evaluated ? (
+            <Badge appearance={result.passed ? 'success' : 'danger'}>
+              {result.passed ? 'Pass' : 'Fail'}
+            </Badge>
+          ) : (
+            <Badge appearance="default">Not evaluated</Badge>
+          ),
+        },
+        {
+          key: `benchmark:${index}:tally`,
+          content: benchmarkTallyLabel(tallies, result.scenario_id),
+        },
+      ],
+    };
+  });
 }
 
 function mergeBenchmarkResults(existing, incoming) {
@@ -389,6 +424,10 @@ const App = () => {
   const [isPostmortemLoading, setIsPostmortemLoading] = useState(false);
   const [benchmarkResults, setBenchmarkResults] = useState([]);
   const [benchmarkMetrics, setBenchmarkMetrics] = useState(null);
+  const [benchmarkTallies, setBenchmarkTallies] = useState(() => ({
+    runs: 0,
+    scenarios: {},
+  }));
   const [isBenchmarkLoading, setIsBenchmarkLoading] = useState(false);
 
   const readLedger = async () => {
@@ -746,15 +785,26 @@ const App = () => {
 
       const metrics = summarizeBenchmarkResults(merged);
       setBenchmarkMetrics(metrics);
+
+      if (finished) {
+        setBenchmarkTallies((previous) =>
+          updateBenchmarkTallies(previous, merged),
+        );
+      }
+
+      const notEvaluatedNote =
+        metrics.not_evaluated_count > 0
+          ? ` ${metrics.not_evaluated_count} scenario(s) were not evaluated because the LLM fell back to the deterministic mock.`
+          : '';
       setMessage({
         appearance: finished
-          ? metrics.error_count > 0
+          ? metrics.error_count > 0 || metrics.not_evaluated_count > 0
             ? 'warning'
             : 'success'
           : 'warning',
         title: finished ? 'Benchmark complete' : 'Benchmark incomplete',
         text: finished
-          ? `${metrics.passed_count}/${metrics.scenario_count} scenarios passed. ${BENCHMARK_LABEL}.`
+          ? `${metrics.passed_count}/${metrics.evaluated_scenario_count} evaluated scenarios passed.${notEvaluatedNote} ${BENCHMARK_LABEL}.`
           : `${remaining.length} scenario(s) still pending. Click Run Benchmark to start a fresh run. ${BENCHMARK_LABEL}.`,
       });
     } catch (error) {
@@ -1007,10 +1057,12 @@ const App = () => {
 
       <Strong>Benchmark</Strong>
       <Text>
-        Runs four synthetic scenarios authored by the developer and compares
+        Runs five synthetic scenarios authored by the developer and compares
         the predicted cause with the known ground truth. These are evaluation
         scenarios, not production incidents, and benchmark runs never write to
-        the ledger, proposal store, or audit log.
+        the ledger, proposal store, or audit log. A scenario that falls back to
+        the deterministic mock is shown as not evaluated and excluded from
+        accuracy.
       </Text>
       <Button
         appearance="primary"
@@ -1037,7 +1089,12 @@ const App = () => {
           )} (${benchmarkMetrics.abstention_correct_count}/${
             benchmarkMetrics.abstain_scenario_count
           })`}</Text>
-          <Text>{`Scenarios passed: ${benchmarkMetrics.passed_count}/${benchmarkMetrics.scenario_count}`}</Text>
+          <Text>{`Scenarios evaluated: ${benchmarkMetrics.evaluated_scenario_count}/${benchmarkMetrics.scenario_count}`}</Text>
+          <Text>{`Scenarios passed: ${benchmarkMetrics.passed_count}/${benchmarkMetrics.evaluated_scenario_count} evaluated`}</Text>
+          {benchmarkMetrics.not_evaluated_count > 0 && (
+            <Text>{`Not evaluated (mock fallback): ${benchmarkMetrics.not_evaluated_count}`}</Text>
+          )}
+          <Text>{`Benchmark runs completed: ${benchmarkTallies.runs}`}</Text>
           <Text>{`Hallucinated citations blocked: ${benchmarkMetrics.hallucinated_citations_blocked}`}</Text>
           <Text>{`Remediation citations blocked: ${benchmarkMetrics.remediation_citations_blocked}`}</Text>
           <Text>{`Label: ${BENCHMARK_LABEL}.`}</Text>
@@ -1046,7 +1103,7 @@ const App = () => {
       <DynamicTable
         caption={`Benchmark results (${BENCHMARK_LABEL})`}
         head={BENCHMARK_HEAD}
-        rows={benchmarkRows(benchmarkResults)}
+        rows={benchmarkRows(benchmarkResults, benchmarkTallies)}
         isLoading={isBenchmarkLoading}
         emptyView="No benchmark results yet. Click Run Benchmark."
       />

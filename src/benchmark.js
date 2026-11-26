@@ -13,9 +13,16 @@
  * - Top-3 correctness uses the same rule against the first three hypotheses.
  * - An abstain scenario passes when no hypothesis clears the same 0.5
  *   confidence threshold used by the proposal builder.
+ * - A scenario produced by the deterministic mock fallback is marked
+ *   `evaluated: false` and excluded from every accuracy denominator. Its
+ *   predictions remain visible for transparency, but it can never count as a
+ *   pass or a failure. Only real LLM output is evaluated.
+ * - Generator errors are evaluated failures, not valid abstentions.
  * - Citations to nonexistent facts and citations to remediation actions are
  *   blocked by the deterministic scorer and counted separately. They can never
- *   contribute to a correct answer.
+ *   contribute to a correct answer. A remediation-blocked count of zero only
+ *   means the model did not cite the bait in that run; the unit tests prove
+ *   separately that a cited remediation fact is blocked and counted.
  */
 import {
   calculateConfidence,
@@ -64,6 +71,51 @@ function isSupportingCausal(citation) {
     citation.role === 'causal' &&
     typeof citation.fact_id === 'string'
   );
+}
+
+const NOT_EVALUATED_REASON =
+  'Deterministic mock fallback used; this scenario was excluded from accuracy.';
+
+/**
+ * Normalizes the two generator return shapes into one internal shape.
+ *
+ * A raw array is treated as real LLM output because only the live wrapper
+ * returns the richer object. Tests and other callers can simulate a mock
+ * fallback by returning `{ hypotheses, source: 'mock' }` or by setting
+ * `fallback_used: true`.
+ *
+ * @param {object[]|{hypotheses: object[], source?: string, fallback_used?: boolean, fallback_reason?: string}} generated
+ * @returns {{hypotheses: object[], source: 'llm'|'mock', source_label: string, fallback_reason: string|null}}
+ */
+function normalizeGeneratorResult(generated) {
+  if (Array.isArray(generated)) {
+    return {
+      hypotheses: generated,
+      source: 'llm',
+      source_label: 'LLM',
+      fallback_reason: null,
+    };
+  }
+
+  if (!isObject(generated) || !Array.isArray(generated.hypotheses)) {
+    throw new Error('Benchmark generator returned no hypotheses array.');
+  }
+
+  const usedMock =
+    generated.fallback_used === true || generated.source === 'mock';
+  const source = usedMock ? 'mock' : 'llm';
+  const fallbackReason =
+    typeof generated.fallback_reason === 'string' &&
+    generated.fallback_reason.length > 0
+      ? generated.fallback_reason
+      : null;
+
+  return {
+    hypotheses: generated.hypotheses,
+    source,
+    source_label: source === 'mock' ? 'Mock fallback' : 'LLM',
+    fallback_reason: fallbackReason,
+  };
 }
 
 /**
@@ -200,12 +252,13 @@ function topHypothesesSummary(hypotheses) {
   }));
 }
 
-function evaluateScenario(scenario, meta, ranked) {
+function evaluateScenario(scenario, meta, ranked, generator) {
   const top = ranked[0] || null;
   const expectedIds = new Set(meta.cause_fact_ids);
   const topConfidence =
     top && typeof top.confidence === 'number' ? top.confidence : null;
   const abstained = top === null || topConfidence < MIN_CONFIDENCE;
+  const evaluated = generator.source !== 'mock';
 
   const topMatchIds =
     !meta.abstain && !abstained && top
@@ -244,9 +297,19 @@ function evaluateScenario(scenario, meta, ranked) {
     predicted_cause_fact_ids: predictedIds,
     confidence: topConfidence,
     abstained,
-    passed,
-    top1_correct: top1Correct,
-    top3_correct: top3Correct,
+    source: generator.source,
+    source_label: generator.source_label,
+    evaluated,
+    not_evaluated_reason: evaluated
+      ? null
+      : generator.fallback_reason
+        ? `${NOT_EVALUATED_REASON} Reason: ${generator.fallback_reason}`
+        : NOT_EVALUATED_REASON,
+    // A mock fallback is not a product prediction, so it is neither a pass nor
+    // a failure. Accuracy and pass counts use only evaluated results.
+    passed: evaluated ? passed : null,
+    top1_correct: evaluated ? top1Correct : null,
+    top3_correct: evaluated ? top3Correct : null,
     error: null,
     hypothesis_count: ranked.length,
     top_hypotheses: topHypothesesSummary(ranked),
@@ -270,9 +333,13 @@ function errorResult(scenario, meta, error) {
     predicted_hypothesis_id: null,
     predicted_cause_fact_ids: [],
     confidence: null,
-    // A generator failure is not a valid abstention. Marking it false keeps a
-    // broken model run from inflating abstention correctness.
+    // A generator failure is not a valid abstention and is not a mock
+    // fallback. It is an attempted LLM result that is counted as a failure.
     abstained: false,
+    source: 'llm',
+    source_label: 'LLM',
+    evaluated: true,
+    not_evaluated_reason: null,
     passed: false,
     top1_correct: meta.abstain ? null : false,
     top3_correct: meta.abstain ? null : false,
@@ -287,18 +354,12 @@ function errorResult(scenario, meta, error) {
 async function runScenario(scenario, generate, meta) {
   try {
     const generated = await generate(scenario);
-    const rawHypotheses = Array.isArray(generated)
-      ? generated
-      : isObject(generated) && Array.isArray(generated.hypotheses)
-        ? generated.hypotheses
-        : null;
-
-    if (rawHypotheses === null) {
-      throw new Error('Benchmark generator returned no hypotheses array.');
-    }
-
-    const ranked = scoreBenchmarkHypotheses(rawHypotheses, scenario.facts);
-    return evaluateScenario(scenario, meta, ranked);
+    const normalized = normalizeGeneratorResult(generated);
+    const ranked = scoreBenchmarkHypotheses(
+      normalized.hypotheses,
+      scenario.facts,
+    );
+    return evaluateScenario(scenario, meta, ranked, normalized);
   } catch (error) {
     return errorResult(scenario, meta, error);
   }
@@ -317,8 +378,20 @@ export function summarizeBenchmarkResults(results) {
   const safeResults = Array.isArray(results)
     ? results.filter((result) => isObject(result))
     : [];
-  const causeResults = safeResults.filter((result) => !result.expected_abstain);
-  const abstainResults = safeResults.filter((result) => result.expected_abstain);
+  // Older results without an explicit `evaluated` flag predate mock-fallback
+  // support and were all real LLM results. Treat only `false` as excluded.
+  const evaluatedResults = safeResults.filter(
+    (result) => result.evaluated !== false,
+  );
+  const notEvaluatedResults = safeResults.filter(
+    (result) => result.evaluated === false,
+  );
+  const causeResults = evaluatedResults.filter(
+    (result) => !result.expected_abstain,
+  );
+  const abstainResults = evaluatedResults.filter(
+    (result) => result.expected_abstain,
+  );
 
   const top1CorrectCount = causeResults.filter(
     (result) => result.top1_correct === true,
@@ -329,13 +402,15 @@ export function summarizeBenchmarkResults(results) {
   const abstentionCorrectCount = abstainResults.filter(
     (result) => result.passed === true,
   ).length;
-  const passedCount = safeResults.filter((result) => result.passed === true).length;
-  const errorCount = safeResults.filter(
+  const passedCount = evaluatedResults.filter(
+    (result) => result.passed === true,
+  ).length;
+  const errorCount = evaluatedResults.filter(
     (result) => typeof result.error === 'string' && result.error.length > 0,
   ).length;
 
   const sumCounts = (field) =>
-    safeResults.reduce((total, result) => {
+    evaluatedResults.reduce((total, result) => {
       const value = result[field];
       return total + (typeof value === 'number' && Number.isFinite(value) ? value : 0);
     }, 0);
@@ -343,6 +418,8 @@ export function summarizeBenchmarkResults(results) {
   return {
     label: BENCHMARK_LABEL,
     scenario_count: safeResults.length,
+    evaluated_scenario_count: evaluatedResults.length,
+    not_evaluated_count: notEvaluatedResults.length,
     cause_scenario_count: causeResults.length,
     abstain_scenario_count: abstainResults.length,
     passed_count: passedCount,
@@ -365,19 +442,97 @@ export function summarizeBenchmarkResults(results) {
   };
 }
 
+function normalizeTally(value) {
+  const read = (field) =>
+    isObject(value) &&
+    Number.isInteger(value[field]) &&
+    value[field] >= 0
+      ? value[field]
+      : 0;
+  return {
+    passed: read('passed'),
+    evaluated: read('evaluated'),
+    not_evaluated: read('not_evaluated'),
+  };
+}
+
+/**
+ * Adds one completed benchmark run to the running per-scenario tallies.
+ *
+ * `runs` counts completed benchmark runs. Each scenario accumulates
+ * `passed`/`evaluated` for the display form `bench_clear 3/3`, plus a separate
+ * `not_evaluated` count. Mock-fallback results only increment
+ * `not_evaluated`, so a fallback cannot lower a scenario's pass rate.
+ *
+ * Call this once per completed run, with results deduplicated by
+ * `scenario_id`. Do not call it once per resolver invocation.
+ *
+ * @param {{runs?: number, scenarios?: Record<string, object>}|null} previous
+ * @param {object[]} results
+ * @returns {{runs: number, scenarios: Record<string, {passed: number, evaluated: number, not_evaluated: number}>}}
+ */
+export function updateBenchmarkTallies(previous, results) {
+  if (!Array.isArray(results)) {
+    throw new TypeError(
+      'updateBenchmarkTallies expects an array of benchmark results.',
+    );
+  }
+
+  const previousRuns =
+    isObject(previous) &&
+    Number.isInteger(previous.runs) &&
+    previous.runs >= 0
+      ? previous.runs
+      : 0;
+  const scenarios = {};
+
+  if (isObject(previous) && isObject(previous.scenarios)) {
+    for (const [scenarioId, tally] of Object.entries(previous.scenarios)) {
+      scenarios[scenarioId] = normalizeTally(tally);
+    }
+  }
+
+  for (const result of results) {
+    if (!isObject(result) || typeof result.scenario_id !== 'string') {
+      continue;
+    }
+
+    const tally =
+      scenarios[result.scenario_id] || {
+        passed: 0,
+        evaluated: 0,
+        not_evaluated: 0,
+      };
+
+    if (result.evaluated === false) {
+      tally.not_evaluated += 1;
+    } else {
+      tally.evaluated += 1;
+      if (result.passed === true) {
+        tally.passed += 1;
+      }
+    }
+
+    scenarios[result.scenario_id] = tally;
+  }
+
+  return { runs: previousRuns + 1, scenarios };
+}
+
 /**
  * Runs every scenario sequentially with the injected generator.
  *
  * Sequential execution is intentional for the live path: it keeps the model
  * calls inside the resolver's time budget and avoids interleaved latency.
  *
- * The generator receives the whole scenario object. It may return either an
- * array of raw hypotheses or an object with a `hypotheses` array, which lets
- * the live wrapper return the Forge LLM result shape directly.
+ * The generator receives the whole scenario object. It may return an array of
+ * raw hypotheses, or an object with a `hypotheses` array plus optional
+ * `source`, `fallback_used`, and `fallback_reason` fields. The live wrapper
+ * returns the Forge LLM result shape; tests can return either shape.
  *
  * @param {object} params
  * @param {object[]} params.scenarios
- * @param {(scenario: object) => Promise<object[]|{hypotheses: object[]}>} params.generate
+ * @param {(scenario: object) => Promise<object[]|{hypotheses: object[], source?: string, fallback_used?: boolean, fallback_reason?: string}>} params.generate
  * @returns {Promise<{label: string, results: object[], metrics: object}>}
  */
 export async function runBenchmark({ scenarios, generate } = {}) {

@@ -44,13 +44,17 @@ Rules:
   "hypothesis_id" (unique non-empty string),
   "summary" (non-empty string, at most 25 words),
   "citations" (array of at most 4 citation objects).
+- The 3 hypotheses must be distinct. Do not reword the same cause three times.
+- At least one hypothesis must attribute the incident to a different service, component, or evidence cluster than the other hypotheses.
 - Each citation must have exactly "hypothesis_id", "fact_id", and "stance".
 - Cite only fact_id values present in the provided facts. Never invent facts or fact IDs.
 - "stance" must be exactly "supports" or "contradicts".
 - An alert fact (fact_type "alert") describes the symptom to be explained. It is context, not causal evidence; never treat an alert as support for a root cause.
 - Alert citations may be included for context, but they contribute no causal weight.
-- Use "contradicts" for facts that weaken a hypothesis, for example a deploy to an unrelated service.
-- Omit facts that are irrelevant to a hypothesis instead of citing them.
+- Review every provided fact for every hypothesis. If a fact weakens the hypothesis — for example, a conflicting change, a deploy to an unrelated service, or a remediation/response action — cite that fact with stance "contradicts".
+- Never omit a weakening fact. Omitting it makes the hypothesis look stronger than the evidence allows.
+- Omit facts that are irrelevant to a hypothesis, but never omit a fact that weakens it.
+- Do not claim that a component, service, deploy, or change exists, changed, failed, or caused the incident unless at least one fact cited for that hypothesis mentions it. Describe only what the cited facts say.
 - Do not include a confidence, probability, score, or any other field.
 - Every hypothesis must cite at least one non-alert provided fact.`;
 
@@ -59,7 +63,9 @@ The previous response was truncated. Return a shorter JSON array now.
 
 Rules:
 - Return JSON only. No prose, no markdown, and no code fences.
-- Return exactly 2 candidate root-cause hypotheses.
+- Return exactly 2 candidate root-cause hypotheses. This is the truncation retry, so return fewer hypotheses than the first attempt.
+- The 2 hypotheses must be distinct. Do not reword the same cause twice.
+- At least one of the 2 hypotheses must attribute the incident to a different service, component, or evidence cluster than the other.
 - Each item must have exactly these fields:
   "hypothesis_id" (unique non-empty string),
   "summary" (non-empty string, at most 20 words),
@@ -68,8 +74,10 @@ Rules:
 - Cite only fact_id values present in the provided facts. Never invent facts or fact IDs.
 - "stance" must be exactly "supports" or "contradicts".
 - An alert fact (fact_type "alert") is context, not causal evidence.
-- Use "contradicts" for facts that weaken a hypothesis.
-- Omit facts that are irrelevant to a hypothesis instead of citing them.
+- Review every provided fact for every hypothesis. If a fact weakens the hypothesis — for example, a conflicting change, a deploy to an unrelated service, or a remediation/response action — cite that fact with stance "contradicts".
+- Never omit a weakening fact. Omitting it makes the hypothesis look stronger than the evidence allows.
+- Omit facts that are irrelevant to a hypothesis, but never omit a fact that weakens it.
+- Do not claim that a component, service, deploy, or change exists, changed, failed, or caused the incident unless at least one fact cited for that hypothesis mentions it. Describe only what the cited facts say.
 - Do not include a confidence, probability, score, or any other field.
 - Every hypothesis must cite at least one non-alert provided fact.`;
 

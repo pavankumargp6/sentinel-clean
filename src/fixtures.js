@@ -121,7 +121,7 @@ export function buildDemoScenario(now = Date.now()) {
 }
 
 /**
- * Builds the four synthetic benchmark scenarios.
+ * Builds the five synthetic benchmark scenarios.
  *
  * These are authored by the developer for evaluation only. They are not live
  * incidents and are not written to the real ledger. Each scenario has a known
@@ -308,6 +308,70 @@ export function buildBenchmarkScenarios(now = Date.now()) {
         }),
       ],
       ground_truth: { cause_fact_ids: ['bench_remediation_true_deploy'] },
+    },
+    {
+      // The rollback is recorded only four minutes before the first alert, so
+      // recency makes it look like a trigger. It is still a
+      // remediation_action: a response action, not a cause. The real change is
+      // the older checkout deploy. The benchmark-only path deliberately lets
+      // the model see this fact so the bait is observable; the parser blocks
+      // and counts any citation to it.
+      id: 'bench_rollback_trap',
+      facts: [
+        createFact({
+          fact_id: 'bench_rollback_trap_alert',
+          fact_type: 'alert',
+          source_system: 'pagerduty',
+          source_ref: 'BENCH-ROLLBACK-TRAP-ALERT',
+          observed_at: observedAt(4 * MINUTE),
+          service_scope: ['checkout-service'],
+          summary:
+            'checkout-service p99 latency rose to 2.6s and the error rate reached 8% in checkout-prod, four minutes after the recorded rollback.',
+          weight: 0.92,
+          cluster: 'bench-rollback-trap-symptom',
+          environment: 'checkout-prod',
+        }),
+        createFact({
+          fact_id: 'bench_rollback_trap_true_deploy',
+          fact_type: 'deploy',
+          source_system: 'bitbucket',
+          source_ref: 'commit:bench-rollback-trap-true',
+          observed_at: observedAt(35 * MINUTE),
+          service_scope: ['checkout-service'],
+          summary:
+            'checkout-service v4.4.0 deployed; added a synchronous inventory-reservation lookup to the checkout request path.',
+          weight: 0.9,
+          cluster: 'bench-rollback-trap-change',
+          environment: 'checkout-prod',
+        }),
+        createFact({
+          fact_id: 'bench_rollback_trap_ticket',
+          fact_type: 'jira_issue',
+          source_system: 'jira',
+          source_ref: 'OPS-8505',
+          observed_at: observedAt(3 * HOUR),
+          service_scope: ['checkout-service'],
+          summary:
+            'Change OPS-8505 approved the checkout-service v4.4.0 inventory-reservation rollout.',
+          weight: 0.78,
+          cluster: 'bench-rollback-trap-change',
+          environment: 'checkout-prod',
+        }),
+        createFact({
+          fact_id: 'bench_rollback_trap_action',
+          fact_type: 'remediation_action',
+          source_system: 'sentinel',
+          source_ref: 'action:bench-rollback-trap',
+          observed_at: observedAt(6 * MINUTE),
+          service_scope: ['checkout-service'],
+          summary:
+            'Recorded response: rolled back checkout-service from v4.4.0 to v4.3.0 four minutes before the first alert. Not executed by this app.',
+          weight: 0.95,
+          cluster: 'bench-rollback-trap-action',
+          environment: 'checkout-prod',
+        }),
+      ],
+      ground_truth: { cause_fact_ids: ['bench_rollback_trap_true_deploy'] },
     },
     {
       // Only an alert and weak, non-causal context are available. Even if the
