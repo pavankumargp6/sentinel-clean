@@ -554,3 +554,104 @@ forge deploy -e development
 - `forge login` reported the keychain error above; `forge lint` and `forge deploy` still completed.
 - Browser flow completed on deployed version `5.4.0`: Load demo scenario, Run Hypothesis Engine (LLM, no fallback), Get Remediation Proposal (matching rank 1), Approve (audit record written).
 - If the retry or salvage path is exercised later, capture the logged `finish_reason`, `output_tokens`, `retry_used`, and `salvage_used` values before changing code.
+
+## 9. Postmortem generator and synthetic benchmark (Session 8)
+- **Date:** Nov 26, 2026
+- **Scope:** Pure postmortem builder, latest-proposal pointer, four synthetic benchmark scenarios, pure benchmark runner, and UI sections. No MCP server, Rovo agent, Confluence write, manifest scope, or external egress was added. No deploy, install, or upgrade was run. The Session 8 code is local only and has not been deployed.
+
+### Changes
+- Added `src/postmortem.js` (pure, no Forge imports, no writes):
+  - `buildPostmortem({ facts, run, proposal, audits, generated_at })` returns one structured object with `available`, `summary`, `timeline`, `root_cause`, `rejected_hypotheses`, `decision_lineage`, `action_items`, and `markdown`.
+  - Markdown has exactly these sections: Summary, Timeline, Root Cause, Rejected Hypotheses, Decision Lineage, Action Items.
+  - Timeline includes every stored fact, sorted by `observed_at` ascending with `fact_id` as the tie-breaker. `remediation_action` rows are labelled `response action — never a cause`.
+  - Root-cause evidence filters remediation citations even from a malformed stored run and reports omitted IDs separately.
+  - Rejected reasons are derived from stored data: contradictions (`contradicted by <fact_id>`), nonexistent citations (`citations rejected as nonexistent: <fact_id>`), blocked remediation citations, insufficient evidence, or being outranked by the top hypothesis.
+  - Decision lineage matches the latest proposal ID, plus same-top-hypothesis audits at or after `run.created_at` so a regenerated proposal ID does not erase lineage.
+  - Action items come only from the stored proposal, are labelled human-executed suggestions, and add `Review change <ticket>` when proposal evidence includes a Jira change.
+  - A missing run returns `available: false` plus `Run the Hypothesis Engine first to generate a postmortem. No stored run exists.`
+- Added `src/benchmark.js` (pure, no Forge or KVS imports):
+  - `runBenchmark({ scenarios, generate })` accepts an injected async generator and runs scenarios sequentially.
+  - Evaluation uses the product's real `calculateConfidence` and `rankHypotheses`; top-1/top-3 require a valid causal `supports` citation to a ground-truth fact. Abstention is the top confidence being below `0.5`.
+  - Metrics: `top1_accuracy`, `top3_accuracy`, `abstention_correctness`, `hallucinated_citations_blocked`, `remediation_citations_blocked`, plus counts and pass/error totals.
+  - Generator errors are per-scenario failures, not valid abstentions. Malformed scenarios throw before any generator call.
+  - `summarizeBenchmarkResults(results)` lets the UI merge results from multiple resolver invocations and recompute the same metrics.
+  - `BENCHMARK_LABEL = 'synthetic scenarios authored by the developer'`.
+- Updated `src/fixtures.js`:
+  - Added `buildBenchmarkScenarios(now)` with four synthetic scenarios:
+    - `bench_clear`: ground truth `bench_clear_deploy`.
+    - `bench_decoy`: a recent unrelated search deploy is the decoy; ground truth is the older `bench_decoy_true_deploy`.
+    - `bench_remediation`: the most recent, highest-weight `bench_remediation_action` is a response action; ground truth is `bench_remediation_true_deploy`.
+    - `bench_weak`: `{ abstain: true }`; even citing every weak fact gives `0.45634`, below `0.5`.
+- Updated `src/runStore.js`:
+  - Added `LAST_PROPOSAL_KEY = 'sentinel:last_proposal'`, `createProposalPointer`, and `isProposalPointer`. The pointer stores only `{ version, proposal_id, created_at }`; the proposal body stays under its own key.
+- Updated `src/index.js`:
+  - `getPostmortem` reads the stored run, ledger, latest proposal pointer/body, and the shared audit reader. No run returns a clear `available: false` result.
+  - New runs, Load, and Reset clear the proposal pointer. `getProposal` sets it only when a qualifying proposal exists.
+  - Added live `runBenchmark`: it runs exactly one pending synthetic scenario per resolver invocation using the existing 15 s attempt / 22 s model budget, then returns `remaining_scenario_ids` for the UI loop. It never reads or writes the real ledger, stored run, proposals, or audit log, and throws away any LLM fallback-to-mock result.
+- Updated `src/frontend/index.jsx`:
+  - Added a Postmortem section with a `Generate Postmortem` button, Markdown in a `CodeBlock`, a no-run warning, and the note that Confluence publishing is not implemented.
+  - Added a Benchmark section with a `Run Benchmark` button, expected-vs-predicted/pass-fail table, summary metrics, the synthetic-scenario label, and a loop that calls the resolver until every scenario has a result.
+  - Running the engine, getting a proposal, loading, resetting, or recording a decision clears the stale postmortem. Benchmark results stay visible because they are synthetic and independent of the real ledger.
+- Added `test/postmortem.test.js` and `test/benchmark.test.js`; added a proposal-pointer test to `test/runStore.test.js`.
+
+### Local checks
+- `npm test` (Node `22.23.4`): **PASS** — 71 tests, 71 passed, 0 failed.
+  - 49 pre-existing tests plus 22 new: 10 postmortem tests, 11 benchmark tests, and 1 proposal-pointer test.
+  - Postmortem coverage: all six sections; timeline includes every fact in order and includes remediation; remediation never appears in root-cause evidence, including a malformed stored run; omitted citations are noted; rejected reasons cover contradiction, nonexistent citation, blocked remediation, insufficient evidence, and outranked; decision lineage matches the proposal and survives regeneration; no-proposal fallback; action items and Jira review suggestion; no-run message.
+  - Benchmark coverage: fixture IDs and ground truth; all four pass with a stub (`top1_accuracy 1`, `top3_accuracy 1`, `abstention_correctness 1`, remediation citations blocked `2`, hallucinated citations blocked `0`); hallucinated citations counted as blocked; hallucination-only answer fails; decoy prediction fails; abstention failure when a hypothesis clears `0.5`; top-3 pass while top-1 fails; generator error is a failure; metrics recompute identically across invocations; benchmark source has no KVS/stored-run/proposal/audit dependency; malformed scenarios fail before the generator.
+  - No test used the network or the real Forge LLM; every benchmark generator was a local stub.
+- Demo postmortem smoke check (stubbed, pure modules): **PASS**
+  - Timeline order: `fact_jira_change_001`, `fact_deploy_root_001`, `fact_deploy_decoy_001`, `fact_alert_001`, `fact_runbook_step_001`, `fact_remediation_001`.
+  - Root evidence excludes `fact_remediation_001`; the Markdown section check passes for all six sections.
+  - Mock top hypothesis `hypothesis_checkout_v2140` at `0.6336`; rejected reasons include `contradicted by fact_deploy_root_001` and `insufficient evidence (confidence 0.00)`.
+  - Action items: `Roll back checkout-service (human-executed; Sentinel does not perform it).` and `Review change OPS-1421 with the change owner before executing.`
+- `npm run lint`: **PASS**.
+- `npx eslint test/postmortem.test.js test/benchmark.test.js test/runStore.test.js`: **PASS**.
+- `node --check src/index.js` and `node --check` on the new pure modules: **PASS**.
+- `git diff --check`: **PASS** (no whitespace errors).
+- No manifest, scope, or dependency change was needed.
+
+### Forge checks
+- `forge lint`: **UNVERIFIED** for the Session 8 code — blocked by CLI authentication in the current shell. The Session 7 `forge lint` PASS was for the previously deployed code, not this working tree.
+  - Exact output:
+    ```
+    Warning: Your version of Forge CLI is out of date. We recommend you update to the latest version to get the latest features and bug fixes.
+    Run npm install -g @forge/cli@latest to update from version 15.0.0 to 16.0.0.
+
+    Error: Not logged in. If a local keychain is available, run forge login, otherwise set environment variables before trying again. See https://go.atlassian.com/dac/platform/forge/getting-started/#log-in-with-an-atlassian-api-token for more.
+    ```
+- `forge deploy --non-interactive -e development`: **UNVERIFIED** — deliberately not run. No deployment was performed.
+- `forge install --upgrade`: not required; no manifest or scope changed.
+
+### UI and live-model acceptance (not yet verified)
+- **UNVERIFIED** — requires deploy + install + browser test:
+  - `Generate Postmortem` renders the Markdown document with all six sections, and the Confluence-not-implemented note is visible.
+  - With no stored run, the button shows the no-run warning instead of an invented postmortem.
+  - `Run Benchmark` completes the UI loop, shows four rows with expected vs predicted and Pass/Fail, and shows the summary metrics.
+  - The live benchmark really runs the LLM once per scenario, stays under the 25 s resolver limit, and does not write to the real ledger, stored run, proposals, or audit log.
+  - Live model accuracy, abstention behavior, latency, and billing remain **UNVERIFIED**; the benchmark tests use stubs only.
+  - Exact benchmark prediction quality for the four scenarios is **UNVERIFIED** until a deployed run is observed.
+
+### Commands run for local verification
+```bash
+cd ~/sentinel-clean
+source ~/.nvm/nvm.sh && nvm use 22.23.4
+npm test
+npm run lint
+npx eslint test/postmortem.test.js test/benchmark.test.js test/runStore.test.js
+node --check src/index.js
+git diff --check
+```
+
+### Exact commands to finish verification (not run)
+```bash
+cd ~/sentinel-clean
+source ~/.nvm/nvm.sh && nvm use 22.23.4
+forge login
+forge lint
+forge deploy --non-interactive -e development
+```
+Notes:
+- `forge login` is interactive; complete it in your terminal.
+- No manifest, scope, or egress changed, so no `--approve` or `forge install --upgrade` is expected.
+- After deploy, run the UI acceptance checklist above and record the live benchmark metrics.

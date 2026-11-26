@@ -121,6 +121,259 @@ export function buildDemoScenario(now = Date.now()) {
 }
 
 /**
+ * Builds the four synthetic benchmark scenarios.
+ *
+ * These are authored by the developer for evaluation only. They are not live
+ * incidents and are not written to the real ledger. Each scenario has a known
+ * ground truth: either the fact ID of the true cause, or `{ abstain: true }`
+ * when no hypothesis should clear the 0.5 confidence threshold.
+ *
+ * The fact IDs are stable so a benchmark run is reproducible. Timestamps are
+ * relative to one `now` per build, which keeps the ordering stable without
+ * making the scenarios depend on wall-clock time.
+ *
+ * @param {number} [now] - Epoch milliseconds used as the scenarios' "now".
+ * @returns {{id: string, facts: object[], ground_truth: object}[]}
+ */
+export function buildBenchmarkScenarios(now = Date.now()) {
+  const observedAt = (millisecondsAgo) =>
+    new Date(now - millisecondsAgo).toISOString();
+
+  return [
+    {
+      // One deploy and its change ticket. The deploy is the only ground-truth
+      // cause; the ticket is same-cluster context, not a second cause.
+      id: 'bench_clear',
+      facts: [
+        createFact({
+          fact_id: 'bench_clear_alert',
+          fact_type: 'alert',
+          source_system: 'pagerduty',
+          source_ref: 'BENCH-CLEAR-ALERT',
+          observed_at: observedAt(8 * MINUTE),
+          service_scope: ['payments-service'],
+          summary:
+            'payments-service p99 latency rose to 1.9s and the error rate reached 5% in payments-prod.',
+          weight: 0.92,
+          cluster: 'bench-clear-symptom',
+          environment: 'payments-prod',
+        }),
+        createFact({
+          fact_id: 'bench_clear_deploy',
+          fact_type: 'deploy',
+          source_system: 'bitbucket',
+          source_ref: 'commit:bench-clear',
+          observed_at: observedAt(25 * MINUTE),
+          service_scope: ['payments-service'],
+          summary:
+            'payments-service v3.8.0 deployed; switched the card authorization path to a new retry loop.',
+          weight: 0.9,
+          cluster: 'bench-clear-change',
+          environment: 'payments-prod',
+        }),
+        createFact({
+          fact_id: 'bench_clear_ticket',
+          fact_type: 'jira_issue',
+          source_system: 'jira',
+          source_ref: 'OPS-8101',
+          observed_at: observedAt(2 * HOUR),
+          service_scope: ['payments-service'],
+          summary:
+            'Change OPS-8101 approved the payments-service v3.8.0 retry-loop rollout.',
+          weight: 0.8,
+          cluster: 'bench-clear-change',
+          environment: 'payments-prod',
+        }),
+      ],
+      ground_truth: { cause_fact_ids: ['bench_clear_deploy'] },
+    },
+    {
+      // A recent unrelated deploy is the decoy. The older checkout deploy is
+      // the true cause, so a recency-only answer will fail.
+      id: 'bench_decoy',
+      facts: [
+        createFact({
+          fact_id: 'bench_decoy_alert',
+          fact_type: 'alert',
+          source_system: 'pagerduty',
+          source_ref: 'BENCH-DECOY-ALERT',
+          observed_at: observedAt(7 * MINUTE),
+          service_scope: ['checkout-service'],
+          summary:
+            'checkout-service p99 latency rose to 2.2s and the error rate reached 6% in checkout-prod.',
+          weight: 0.92,
+          cluster: 'bench-decoy-symptom',
+          environment: 'checkout-prod',
+        }),
+        createFact({
+          fact_id: 'bench_decoy_true_deploy',
+          fact_type: 'deploy',
+          source_system: 'bitbucket',
+          source_ref: 'commit:bench-decoy-true',
+          observed_at: observedAt(27 * MINUTE),
+          service_scope: ['checkout-service'],
+          summary:
+            'checkout-service v4.2.0 deployed; moved discount calculation into the synchronous checkout request path.',
+          weight: 0.9,
+          cluster: 'bench-decoy-change',
+          environment: 'checkout-prod',
+        }),
+        createFact({
+          fact_id: 'bench_decoy_false_deploy',
+          fact_type: 'deploy',
+          source_system: 'bitbucket',
+          source_ref: 'commit:bench-decoy-false',
+          observed_at: observedAt(4 * MINUTE),
+          service_scope: ['search-service'],
+          summary:
+            'search-service v9.1.0 deployed to search-prod; it shares no services with checkout.',
+          weight: 0.2,
+          cluster: 'bench-decoy-distractor',
+          environment: 'search-prod',
+        }),
+        createFact({
+          fact_id: 'bench_decoy_ticket',
+          fact_type: 'jira_issue',
+          source_system: 'jira',
+          source_ref: 'OPS-8202',
+          observed_at: observedAt(3 * HOUR),
+          service_scope: ['checkout-service'],
+          summary:
+            'Change OPS-8202 approved the checkout-service v4.2.0 discount-calculation rollout.',
+          weight: 0.78,
+          cluster: 'bench-decoy-change',
+          environment: 'checkout-prod',
+        }),
+      ],
+      ground_truth: { cause_fact_ids: ['bench_decoy_true_deploy'] },
+    },
+    {
+      // The remediation action is the most recent and has the highest stored
+      // weight, so it looks causal by timing alone. The real change is the
+      // older deploy. The Causal Inversion Guard must keep the remediation out
+      // of the model's input and the scorer must block any citation to it.
+      id: 'bench_remediation',
+      facts: [
+        createFact({
+          fact_id: 'bench_remediation_alert',
+          fact_type: 'alert',
+          source_system: 'pagerduty',
+          source_ref: 'BENCH-REMEDIATION-ALERT',
+          observed_at: observedAt(9 * MINUTE),
+          service_scope: ['checkout-service'],
+          summary:
+            'checkout-service p99 latency rose to 2.5s after the v4.3.0 rollout in checkout-prod.',
+          weight: 0.92,
+          cluster: 'bench-remediation-symptom',
+          environment: 'checkout-prod',
+        }),
+        createFact({
+          fact_id: 'bench_remediation_true_deploy',
+          fact_type: 'deploy',
+          source_system: 'bitbucket',
+          source_ref: 'commit:bench-remediation-true',
+          observed_at: observedAt(30 * MINUTE),
+          service_scope: ['checkout-service'],
+          summary:
+            'checkout-service v4.3.0 deployed; added a synchronous loyalty-points lookup to checkout.',
+          weight: 0.9,
+          cluster: 'bench-remediation-change',
+          environment: 'checkout-prod',
+        }),
+        createFact({
+          fact_id: 'bench_remediation_ticket',
+          fact_type: 'jira_issue',
+          source_system: 'jira',
+          source_ref: 'OPS-8303',
+          observed_at: observedAt(3 * HOUR),
+          service_scope: ['checkout-service'],
+          summary:
+            'Change OPS-8303 approved the checkout-service v4.3.0 loyalty-points rollout.',
+          weight: 0.78,
+          cluster: 'bench-remediation-change',
+          environment: 'checkout-prod',
+        }),
+        createFact({
+          fact_id: 'bench_remediation_action',
+          fact_type: 'remediation_action',
+          source_system: 'sentinel',
+          source_ref: 'action:bench-rollback',
+          observed_at: observedAt(3 * MINUTE),
+          service_scope: ['checkout-service'],
+          summary:
+            'Recorded response: rolled back checkout-service to v4.2.9. Not executed by this app.',
+          weight: 0.95,
+          cluster: 'bench-remediation-action',
+          environment: 'checkout-prod',
+        }),
+      ],
+      ground_truth: { cause_fact_ids: ['bench_remediation_true_deploy'] },
+    },
+    {
+      // Only an alert and weak, non-causal context are available. Even if the
+      // model cites every weak fact, their noisy-OR support stays below 0.5:
+      // 1 - (1-0.18)(1-0.22)(1-0.15) = 0.45634. The correct output is abstain.
+      id: 'bench_weak',
+      facts: [
+        createFact({
+          fact_id: 'bench_weak_alert',
+          fact_type: 'alert',
+          source_system: 'pagerduty',
+          source_ref: 'BENCH-WEAK-ALERT',
+          observed_at: observedAt(12 * MINUTE),
+          service_scope: ['checkout-service'],
+          summary:
+            'checkout-service p99 latency briefly crossed 2.1s in checkout-prod; the alert has not repeated.',
+          weight: 0.9,
+          cluster: 'bench-weak-symptom',
+          environment: 'checkout-prod',
+        }),
+        createFact({
+          fact_id: 'bench_weak_runbook',
+          fact_type: 'runbook_step',
+          source_system: 'runbook',
+          source_ref: 'RB-BENCH-WEAK#step-1',
+          observed_at: observedAt(10 * MINUTE),
+          service_scope: ['checkout-service'],
+          summary:
+            'Runbook step: compare the alert time with deploys, but no deploy fact exists in this scenario.',
+          weight: 0.18,
+          cluster: 'bench-weak-runbook',
+          environment: 'checkout-prod',
+        }),
+        createFact({
+          fact_id: 'bench_weak_prior',
+          fact_type: 'prior_incident',
+          source_system: 'sentinel',
+          source_ref: 'INC-BENCH-WEAK-OLD',
+          observed_at: observedAt(2 * HOUR),
+          service_scope: ['checkout-service'],
+          summary:
+            'A similar latency alert three weeks ago was traced to a database failover; no failover fact exists today.',
+          weight: 0.22,
+          cluster: 'bench-weak-prior',
+          environment: 'checkout-prod',
+        }),
+        createFact({
+          fact_id: 'bench_weak_jira',
+          fact_type: 'jira_issue',
+          source_system: 'jira',
+          source_ref: 'OPS-8404',
+          observed_at: observedAt(4 * HOUR),
+          service_scope: ['checkout-service'],
+          summary:
+            'OPS-8404 is an unapproved proposal to tune checkout timeouts; no change was deployed.',
+          weight: 0.15,
+          cluster: 'bench-weak-change',
+          environment: 'checkout-prod',
+        }),
+      ],
+      ground_truth: { abstain: true },
+    },
+  ];
+}
+
+/**
  * Seeded demo blast-radius table.
  *
  * This is intentionally small, hand-entered demo data for the checkout

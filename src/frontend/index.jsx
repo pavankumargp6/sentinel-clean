@@ -11,6 +11,11 @@ import ForgeReconciler, {
 } from '@forge/react';
 import { invoke } from '@forge/bridge';
 
+import {
+  BENCHMARK_LABEL,
+  summarizeBenchmarkResults,
+} from '../benchmark.js';
+
 const TABLE_HEAD = {
   cells: [
     { key: 'type', content: 'Type', isSortable: true },
@@ -98,6 +103,31 @@ const AUDIT_HEAD = {
       isSortable: true,
       shouldTruncate: true,
     },
+  ],
+};
+
+const BENCHMARK_HEAD = {
+  cells: [
+    {
+      key: 'scenario',
+      content: 'Scenario',
+      isSortable: true,
+      shouldTruncate: true,
+    },
+    {
+      key: 'expected',
+      content: 'Expected',
+      isSortable: true,
+      shouldTruncate: true,
+    },
+    {
+      key: 'predicted',
+      content: 'Predicted',
+      isSortable: true,
+      shouldTruncate: true,
+    },
+    { key: 'confidence', content: 'Confidence', isSortable: true },
+    { key: 'result', content: 'Result', isSortable: true },
   ],
 };
 
@@ -279,6 +309,62 @@ function messageFor(error) {
   return error && error.message ? error.message : String(error);
 }
 
+function formatAccuracy(value) {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? `${Math.round(value * 100)}%`
+    : 'n/a';
+}
+
+function benchmarkRows(results) {
+  if (!Array.isArray(results) || results.length === 0) {
+    return [];
+  }
+
+  return results.map((result, index) => ({
+    key: `benchmark:${result.scenario_id ?? index}`,
+    cells: [
+      { key: `benchmark:${index}:scenario`, content: result.scenario_id },
+      { key: `benchmark:${index}:expected`, content: result.expected_label },
+      {
+        key: `benchmark:${index}:predicted`,
+        content: result.error
+          ? `${result.predicted_label} (${result.error})`
+          : result.predicted_label,
+      },
+      {
+        key: `benchmark:${index}:confidence`,
+        content:
+          typeof result.confidence === 'number'
+            ? result.confidence.toFixed(2)
+            : 'n/a',
+      },
+      {
+        key: `benchmark:${index}:result`,
+        content: (
+          <Badge appearance={result.passed ? 'success' : 'danger'}>
+            {result.passed ? 'Pass' : 'Fail'}
+          </Badge>
+        ),
+      },
+    ],
+  }));
+}
+
+function mergeBenchmarkResults(existing, incoming) {
+  const byScenario = new Map();
+  for (const result of Array.isArray(existing) ? existing : []) {
+    if (result && typeof result.scenario_id === 'string') {
+      byScenario.set(result.scenario_id, result);
+    }
+  }
+  for (const result of Array.isArray(incoming) ? incoming : []) {
+    if (result && typeof result.scenario_id === 'string') {
+      byScenario.set(result.scenario_id, result);
+    }
+  }
+  return Array.from(byScenario.values());
+}
+
 function sourceLabel(run) {
   if (!run) {
     return null;
@@ -299,6 +385,11 @@ const App = () => {
   const [isEngineLoading, setIsEngineLoading] = useState(false);
   const [isProposalLoading, setIsProposalLoading] = useState(false);
   const [isDecisionLoading, setIsDecisionLoading] = useState(false);
+  const [postmortem, setPostmortem] = useState(null);
+  const [isPostmortemLoading, setIsPostmortemLoading] = useState(false);
+  const [benchmarkResults, setBenchmarkResults] = useState([]);
+  const [benchmarkMetrics, setBenchmarkMetrics] = useState(null);
+  const [isBenchmarkLoading, setIsBenchmarkLoading] = useState(false);
 
   const readLedger = async () => {
     const result = await invoke('getLedger');
@@ -390,6 +481,7 @@ const App = () => {
       setHypotheses([]);
       setEngineRun(null);
       setProposalRun(null);
+      setPostmortem(null);
       setDecision(null);
       setDecisionNote('');
       setMessage({
@@ -423,6 +515,7 @@ const App = () => {
       setHypotheses([]);
       setEngineRun(null);
       setProposalRun(null);
+      setPostmortem(null);
       setDecision(null);
       setDecisionNote('');
       setMessage({
@@ -446,6 +539,7 @@ const App = () => {
     setMessage(null);
     setEngineRun(null);
     setProposalRun(null);
+    setPostmortem(null);
     setDecision(null);
     setDecisionNote('');
     try {
@@ -497,6 +591,7 @@ const App = () => {
     setIsProposalLoading(true);
     setMessage(null);
     setProposalRun(null);
+    setPostmortem(null);
     setDecision(null);
     setDecisionNote('');
     try {
@@ -550,6 +645,7 @@ const App = () => {
       }
 
       setDecision(value);
+      setPostmortem(null);
       setMessage({
         appearance: 'success',
         title: `Proposal ${value === 'approve' ? 'approved' : 'rejected'}`,
@@ -567,8 +663,118 @@ const App = () => {
     }
   };
 
+  const handleGeneratePostmortem = async () => {
+    setIsPostmortemLoading(true);
+    setMessage(null);
+    setPostmortem(null);
+    try {
+      const result = await invoke('getPostmortem');
+      if (!result || result.status !== 'SUCCESS') {
+        throw new Error(
+          (result && result.message) || 'getPostmortem did not complete.',
+        );
+      }
+
+      setPostmortem(result);
+      if (result.available) {
+        setMessage({
+          appearance: 'success',
+          title: 'Postmortem generated',
+          text: 'Generated from stored data only. No model call was made.',
+        });
+      }
+    } catch (error) {
+      setMessage({
+        appearance: 'error',
+        title: 'Postmortem failed',
+        text: messageFor(error),
+      });
+    } finally {
+      setIsPostmortemLoading(false);
+    }
+  };
+
+  const handleRunBenchmark = async () => {
+    setIsBenchmarkLoading(true);
+    setBenchmarkResults([]);
+    setBenchmarkMetrics(null);
+    setMessage(null);
+
+    try {
+      let completed = [];
+      let merged = [];
+      let remaining = [];
+      let lastCount = -1;
+      let finished = false;
+
+      // The resolver runs one synthetic scenario per invocation so a real
+      // model call stays inside the 25 s resolver limit. It returns the
+      // remaining IDs; call it again until every scenario has a result. The
+      // cap prevents an accidental infinite loop if a response makes no
+      // progress.
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        const result = await invoke('runBenchmark', {
+          completed_scenario_ids: completed,
+        });
+        if (!result || result.status !== 'SUCCESS') {
+          throw new Error(
+            (result && result.message) || 'runBenchmark did not complete.',
+          );
+        }
+
+        merged = mergeBenchmarkResults(merged, result.results);
+        completed = Array.isArray(result.completed_scenario_ids)
+          ? result.completed_scenario_ids
+          : completed;
+        remaining = Array.isArray(result.remaining_scenario_ids)
+          ? result.remaining_scenario_ids
+          : [];
+
+        setBenchmarkResults(merged);
+        setBenchmarkMetrics(summarizeBenchmarkResults(merged));
+
+        if (result.done || remaining.length === 0) {
+          finished = true;
+          break;
+        }
+        if (merged.length <= lastCount) {
+          // No new scenario result. Stop instead of looping forever.
+          break;
+        }
+        lastCount = merged.length;
+      }
+
+      const metrics = summarizeBenchmarkResults(merged);
+      setBenchmarkMetrics(metrics);
+      setMessage({
+        appearance: finished
+          ? metrics.error_count > 0
+            ? 'warning'
+            : 'success'
+          : 'warning',
+        title: finished ? 'Benchmark complete' : 'Benchmark incomplete',
+        text: finished
+          ? `${metrics.passed_count}/${metrics.scenario_count} scenarios passed. ${BENCHMARK_LABEL}.`
+          : `${remaining.length} scenario(s) still pending. Click Run Benchmark to start a fresh run. ${BENCHMARK_LABEL}.`,
+      });
+    } catch (error) {
+      setMessage({
+        appearance: 'error',
+        title: 'Benchmark failed',
+        text: messageFor(error),
+      });
+    } finally {
+      setIsBenchmarkLoading(false);
+    }
+  };
+
   const isBusy =
-    isLoading || isEngineLoading || isProposalLoading || isDecisionLoading;
+    isLoading ||
+    isEngineLoading ||
+    isProposalLoading ||
+    isDecisionLoading ||
+    isPostmortemLoading ||
+    isBenchmarkLoading;
 
   return (
     <>
@@ -774,6 +980,75 @@ const App = () => {
         rows={auditRows(auditLog)}
         isLoading={isDecisionLoading}
         emptyView="No decisions recorded yet."
+      />
+
+      <Strong>Postmortem</Strong>
+      <Text>
+        Generates a Markdown postmortem from the stored scored run, the latest
+        proposal, and the audit log. No model call is made. Confluence
+        publishing is not implemented yet.
+      </Text>
+      <Button
+        appearance="primary"
+        onClick={handleGeneratePostmortem}
+        isDisabled={isBusy}
+      >
+        Generate Postmortem
+      </Button>
+      {isPostmortemLoading && <Text>Generating postmortem…</Text>}
+      {postmortem && postmortem.available && (
+        <CodeBlock text={postmortem.markdown} language="text" />
+      )}
+      {postmortem && !postmortem.available && (
+        <SectionMessage appearance="warning" title="No postmortem available">
+          <Text>{postmortem.reason || 'Run the Hypothesis Engine first.'}</Text>
+        </SectionMessage>
+      )}
+
+      <Strong>Benchmark</Strong>
+      <Text>
+        Runs four synthetic scenarios authored by the developer and compares
+        the predicted cause with the known ground truth. These are evaluation
+        scenarios, not production incidents, and benchmark runs never write to
+        the ledger, proposal store, or audit log.
+      </Text>
+      <Button
+        appearance="primary"
+        onClick={handleRunBenchmark}
+        isDisabled={isBusy}
+      >
+        Run Benchmark
+      </Button>
+      {isBenchmarkLoading && <Text>Running synthetic scenarios…</Text>}
+      {benchmarkMetrics && (
+        <>
+          <Text>{`Top-1 accuracy: ${formatAccuracy(
+            benchmarkMetrics.top1_accuracy,
+          )} (${benchmarkMetrics.top1_correct_count}/${
+            benchmarkMetrics.cause_scenario_count
+          })`}</Text>
+          <Text>{`Top-3 accuracy: ${formatAccuracy(
+            benchmarkMetrics.top3_accuracy,
+          )} (${benchmarkMetrics.top3_correct_count}/${
+            benchmarkMetrics.cause_scenario_count
+          })`}</Text>
+          <Text>{`Abstention correctness: ${formatAccuracy(
+            benchmarkMetrics.abstention_correctness,
+          )} (${benchmarkMetrics.abstention_correct_count}/${
+            benchmarkMetrics.abstain_scenario_count
+          })`}</Text>
+          <Text>{`Scenarios passed: ${benchmarkMetrics.passed_count}/${benchmarkMetrics.scenario_count}`}</Text>
+          <Text>{`Hallucinated citations blocked: ${benchmarkMetrics.hallucinated_citations_blocked}`}</Text>
+          <Text>{`Remediation citations blocked: ${benchmarkMetrics.remediation_citations_blocked}`}</Text>
+          <Text>{`Label: ${BENCHMARK_LABEL}.`}</Text>
+        </>
+      )}
+      <DynamicTable
+        caption={`Benchmark results (${BENCHMARK_LABEL})`}
+        head={BENCHMARK_HEAD}
+        rows={benchmarkRows(benchmarkResults)}
+        isLoading={isBenchmarkLoading}
+        emptyView="No benchmark results yet. Click Run Benchmark."
       />
     </>
   );

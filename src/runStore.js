@@ -13,7 +13,58 @@ import { buildTopProposal } from './remediation.js';
 
 export const LAST_RUN_KEY = 'sentinel:last_run';
 export const LAST_RUN_VERSION = 1;
+export const LAST_PROPOSAL_KEY = 'sentinel:last_proposal';
+export const LAST_PROPOSAL_VERSION = 1;
 export const RUN_SOURCES = Object.freeze(['llm', 'mock']);
+
+/**
+ * Builds the pointer to the latest stored proposal.
+ *
+ * The proposal body stays under its own key. This pointer only says which
+ * proposal belongs to the stored run, so getPostmortem can read the same
+ * proposal that recordDecision audited without scanning proposal keys.
+ *
+ * @param {object} params
+ * @param {string} params.proposalId
+ * @param {string} [params.createdAt]
+ * @returns {object}
+ */
+export function createProposalPointer({
+  proposalId,
+  createdAt = new Date().toISOString(),
+} = {}) {
+  if (typeof proposalId !== 'string' || proposalId.trim().length === 0) {
+    throw new TypeError('createProposalPointer expects a non-empty proposalId.');
+  }
+  if (typeof createdAt !== 'string' || createdAt.trim().length === 0) {
+    throw new TypeError('createProposalPointer expects a non-empty createdAt.');
+  }
+
+  return {
+    version: LAST_PROPOSAL_VERSION,
+    proposal_id: proposalId.trim(),
+    created_at: createdAt.trim(),
+  };
+}
+
+/**
+ * Validates a proposal pointer read from KVS.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isProposalPointer(value) {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      value.version === LAST_PROPOSAL_VERSION &&
+      typeof value.proposal_id === 'string' &&
+      value.proposal_id.length > 0 &&
+      typeof value.created_at === 'string' &&
+      value.created_at.length > 0,
+  );
+}
 
 /**
  * Builds the stored run object.

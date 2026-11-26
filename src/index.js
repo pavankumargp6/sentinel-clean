@@ -2,7 +2,7 @@ import Resolver from '@forge/resolver';
 import api from '@forge/api';
 import { kvs, WhereConditions } from '@forge/kvs';
 
-import { buildDemoScenario } from './fixtures.js';
+import { buildDemoScenario, buildBenchmarkScenarios } from './fixtures.js';
 import {
   applyCausalInversionGuard,
   calculateConfidence,
@@ -11,11 +11,20 @@ import {
 import { generateHypotheses as generateHypothesesWithLLM } from './llm.js';
 import { proposalKey } from './remediation.js';
 import {
+  LAST_PROPOSAL_KEY,
   LAST_RUN_KEY,
+  createProposalPointer,
   createStoredRun,
+  isProposalPointer,
   isStoredRun,
   proposalFromStoredRun,
 } from './runStore.js';
+import {
+  BENCHMARK_LABEL,
+  runBenchmark as runBenchmarkWithScenarios,
+  summarizeBenchmarkResults,
+} from './benchmark.js';
+import { buildPostmortem } from './postmortem.js';
 import {
   AUDIT_INDEX_KEY,
   AUDIT_INDEX_VERSION,
@@ -198,6 +207,30 @@ function citationIds(citations) {
   return Array.from(new Set(ids));
 }
 
+/**
+ * Reads every audit record in index order. getAuditLog and getPostmortem share
+ * this path so the decision lineage is exactly the log the user can see.
+ */
+async function readAuditRecords() {
+  const indexRaw = await kvs.get(AUDIT_INDEX_KEY);
+  if (
+    !indexRaw ||
+    typeof indexRaw !== 'object' ||
+    !Array.isArray(indexRaw.audit_ids)
+  ) {
+    return [];
+  }
+
+  const ids = indexRaw.audit_ids.filter((id) => typeof id === 'string');
+  const stored = await Promise.all(
+    ids.map(async (id) => ({ id, record: await kvs.get(auditKey(id)) })),
+  );
+
+  return stored
+    .filter((entry) => entry.record && typeof entry.record === 'object')
+    .map((entry) => entry.record);
+}
+
 // ---------------------------------------------------------------------------
 // Existing verified handler: do not change its behavior.
 // ---------------------------------------------------------------------------
@@ -259,6 +292,10 @@ resolver.define('loadDemoScenario', async () => {
     // A new ledger invalidates the last scored run. getProposal must not use
     // hypotheses scored against facts that no longer exist.
     await kvs.delete(LAST_RUN_KEY);
+
+    // The latest proposal belonged to the old run. Clearing the pointer keeps
+    // getPostmortem from mixing a new ledger with an old decision.
+    await kvs.delete(LAST_PROPOSAL_KEY);
 
     // Best-effort sweep for keys left behind by an earlier half-failed run.
     // Never delete a key that belongs to the current scenario.
@@ -367,6 +404,10 @@ resolver.define('generateHypotheses', async () => {
     });
     await kvs.set(LAST_RUN_KEY, storedRun, { keyPolicy: 'OVERRIDE' });
 
+    // A new run invalidates the previous proposal pointer. getPostmortem must
+    // not attach an old decision to the new run's hypotheses.
+    await kvs.delete(LAST_PROPOSAL_KEY);
+
     return {
       status: 'SUCCESS',
       source: generated.source,
@@ -419,15 +460,31 @@ resolver.define('getProposal', async () => {
     // client to echo the full proposal back. The proposal is not an audit
     // record; it may be overwritten by the next getProposal call.
     if (proposal) {
+      const proposalCreatedAt = new Date(now).toISOString();
       await kvs.set(
         proposalKey(proposal.proposal_id),
         {
           proposal,
           top_hypothesis: topHypothesis,
-          created_at: new Date(now).toISOString(),
+          created_at: proposalCreatedAt,
         },
         { keyPolicy: 'OVERRIDE' },
       );
+
+      // Point getPostmortem at the proposal that belongs to this stored run.
+      // The proposal body stays under its own key; this pointer is only the
+      // handoff between the proposal and the postmortem.
+      await kvs.set(
+        LAST_PROPOSAL_KEY,
+        createProposalPointer({
+          proposalId: proposal.proposal_id,
+          createdAt: proposalCreatedAt,
+        }),
+        { keyPolicy: 'OVERRIDE' },
+      );
+    } else {
+      // No qualifying proposal means there is no proposal lineage for this run.
+      await kvs.delete(LAST_PROPOSAL_KEY);
     }
 
     return {
@@ -531,26 +588,159 @@ resolver.define('recordDecision', async ({ payload, context } = {}) => {
 
 resolver.define('getAuditLog', async () => {
   try {
-    const indexRaw = await kvs.get(AUDIT_INDEX_KEY);
-    if (
-      !indexRaw ||
-      typeof indexRaw !== 'object' ||
-      !Array.isArray(indexRaw.audit_ids)
-    ) {
-      return { status: 'SUCCESS', audits: [], count: 0 };
-    }
-
-    const ids = indexRaw.audit_ids.filter((id) => typeof id === 'string');
-    const stored = await Promise.all(
-      ids.map(async (id) => ({ id, record: await kvs.get(auditKey(id)) })),
-    );
-    const audits = stored
-      .filter((entry) => entry.record && typeof entry.record === 'object')
-      .map((entry) => entry.record);
-
+    const audits = await readAuditRecords();
     return { status: 'SUCCESS', audits, count: audits.length };
   } catch (error) {
     console.error('getAuditLog failed:', error);
+    return { status: 'ERROR', message: errorMessage(error) };
+  }
+});
+
+resolver.define('getPostmortem', async () => {
+  try {
+    const storedRun = await kvs.get(LAST_RUN_KEY);
+
+    // No stored run: return a clear message instead of inventing an incident.
+    if (!isStoredRun(storedRun)) {
+      const postmortem = buildPostmortem({
+        facts: [],
+        run: null,
+        proposal: null,
+        audits: [],
+      });
+      return {
+        status: 'SUCCESS',
+        available: false,
+        reason: postmortem.reason,
+        markdown: postmortem.markdown,
+        postmortem,
+      };
+    }
+
+    const { facts, missing } = await readLedgerFacts();
+    warnAboutMissing('getPostmortem', missing);
+
+    // The pointer is written by getProposal. Reading the proposal body here
+    // keeps the postmortem's action items and decision lineage aligned with
+    // the exact proposal that recordDecision audited.
+    const pointer = await kvs.get(LAST_PROPOSAL_KEY);
+    let proposal = null;
+    if (isProposalPointer(pointer)) {
+      const storedProposal = await kvs.get(proposalKey(pointer.proposal_id));
+      if (
+        storedProposal &&
+        typeof storedProposal === 'object' &&
+        storedProposal.proposal
+      ) {
+        proposal = storedProposal.proposal;
+      }
+    }
+
+    const audits = await readAuditRecords();
+    const postmortem = buildPostmortem({
+      facts,
+      run: storedRun,
+      proposal,
+      audits,
+    });
+
+    return {
+      status: 'SUCCESS',
+      available: postmortem.available,
+      reason: postmortem.reason,
+      markdown: postmortem.markdown,
+      postmortem,
+    };
+  } catch (error) {
+    console.error('getPostmortem failed:', error);
+    return { status: 'ERROR', message: errorMessage(error) };
+  }
+});
+
+resolver.define('runBenchmark', async ({ payload } = {}) => {
+  try {
+    const body = payload && typeof payload === 'object' ? payload : {};
+    const completed = Array.isArray(body.completed_scenario_ids)
+      ? body.completed_scenario_ids.filter((id) => typeof id === 'string')
+      : [];
+    const completedSet = new Set(completed);
+    const scenarios = buildBenchmarkScenarios();
+
+    // Run exactly one pending scenario per resolver invocation. The resolver
+    // limit is 25 seconds, and one real model call can use up to 22 seconds
+    // (one 15-second attempt plus a retry), so stacking scenarios here would
+    // risk a timeout. The UI calls this resolver again with the completed IDs
+    // until every scenario has a result.
+    const next = scenarios.find(
+      (scenario) => !completedSet.has(scenario.id),
+    );
+
+    if (!next) {
+      return {
+        status: 'SUCCESS',
+        label: BENCHMARK_LABEL,
+        results: [],
+        metrics: summarizeBenchmarkResults([]),
+        completed_scenario_ids: completed,
+        remaining_scenario_ids: [],
+        done: true,
+      };
+    }
+
+    // The benchmark generator is a thin wrapper around the real LLM. It
+    // deliberately throws when the LLM falls back to the mock so mock output
+    // can never be counted as a benchmark prediction. The wrapper returns the
+    // full LLM result shape; runBenchmark accepts either that shape or a raw
+    // hypothesis array.
+    const generate = async (scenario) => {
+      const filteredFacts = applyCausalInversionGuard(scenario.facts);
+      const blockedFactIds = scenario.facts
+        .filter((fact) => fact.fact_type === 'remediation_action')
+        .map((fact) => fact.fact_id);
+      const generated = await generateHypothesesWithLLM(
+        filteredFacts,
+        blockedFactIds,
+      );
+
+      if (generated.fallback_used || generated.source !== 'llm') {
+        throw new Error(
+          generated.fallback_reason ||
+            'Benchmark LLM call fell back to the deterministic mock; the result was discarded.',
+        );
+      }
+      return generated;
+    };
+
+    const scenarioRun = await runBenchmarkWithScenarios({
+      scenarios: [next],
+      generate,
+    });
+    const results = scenarioRun.results;
+
+    const completedIds = [...completed];
+    for (const result of results) {
+      if (!completedIds.includes(result.scenario_id)) {
+        completedIds.push(result.scenario_id);
+      }
+    }
+    const remainingIds = scenarios
+      .map((scenario) => scenario.id)
+      .filter((id) => !completedIds.includes(id));
+
+    // These metrics cover the result returned by this invocation. The UI
+    // merges results from every invocation and recomputes the full summary
+    // with summarizeBenchmarkResults.
+    return {
+      status: 'SUCCESS',
+      label: BENCHMARK_LABEL,
+      results,
+      metrics: summarizeBenchmarkResults(results),
+      completed_scenario_ids: completedIds,
+      remaining_scenario_ids: remainingIds,
+      done: remainingIds.length === 0,
+    };
+  } catch (error) {
+    console.error('runBenchmark failed:', error);
     return { status: 'ERROR', message: errorMessage(error) };
   }
 });
@@ -601,6 +791,7 @@ resolver.define('resetDemoData', async () => {
     // The scored run belonged to the cleared ledger; remove it so getProposal
     // asks the user to run the engine again.
     await kvs.delete(LAST_RUN_KEY);
+    await kvs.delete(LAST_PROPOSAL_KEY);
 
     return { status: 'SUCCESS', cleared };
   } catch (error) {

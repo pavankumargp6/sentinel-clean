@@ -9,8 +9,11 @@ import {
 } from '../src/scoring.js';
 import { generateMockHypotheses } from '../src/mockLLM.js';
 import {
+  LAST_PROPOSAL_KEY,
   LAST_RUN_KEY,
+  createProposalPointer,
   createStoredRun,
+  isProposalPointer,
   isStoredRun,
   proposalFromStoredRun,
 } from '../src/runStore.js';
@@ -128,4 +131,25 @@ test('createStoredRun rejects empty hypotheses and invalid sources', () => {
     () => createStoredRun({ hypotheses: [{}], source: 'other', model: 'm' }),
     /source/,
   );
+});
+
+test('proposal pointer identifies the latest proposal without copying its body', () => {
+  const createdAt = new Date(FIXED_NOW).toISOString();
+  const pointer = createProposalPointer({
+    proposalId: 'proposal_abc',
+    createdAt,
+  });
+
+  assert.equal(LAST_PROPOSAL_KEY, 'sentinel:last_proposal');
+  assert.deepEqual(pointer, {
+    version: 1,
+    proposal_id: 'proposal_abc',
+    created_at: createdAt,
+  });
+  assert.equal(isProposalPointer(pointer), true);
+  assert.equal(isProposalPointer(null), false);
+  assert.equal(isProposalPointer([]), false);
+  assert.equal(isProposalPointer({ ...pointer, version: 2 }), false);
+  assert.equal(isProposalPointer({ ...pointer, proposal_id: '' }), false);
+  assert.throws(() => createProposalPointer({ proposalId: '' }), /proposalId/);
 });
